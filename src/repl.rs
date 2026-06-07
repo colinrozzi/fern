@@ -1,7 +1,7 @@
 //! Interactive REPL — a thin frontend over the daemon's client API.
 //!
 //! No in-process tree; every submission goes to the daemon. The cursor lives
-//! in the shared XDG cursor file, so `shsh run` invocations from other
+//! in the shared XDG cursor file, so `fern run` invocations from other
 //! terminals stay in sync.
 
 use anyhow::{Result, anyhow};
@@ -15,7 +15,7 @@ use crate::wire::{Stream, TreeSnapshot};
 pub async fn run() -> Result<()> {
     let mut cursor: CellId = client::read_cursor();
 
-    println!("shsh repl — type :help for commands, :quit to exit");
+    println!("fern repl — type :help for commands, :quit to exit");
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();

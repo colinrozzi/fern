@@ -41,7 +41,7 @@ pub async fn run() -> Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener =
         UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
-    eprintln!("shsh daemon listening on {}", path.display());
+    eprintln!("fern daemon listening on {}", path.display());
 
     let (events, _) = broadcast::channel(4096);
     let state = Arc::new(DaemonState {
@@ -362,7 +362,7 @@ async fn run_detached(
             (parent_state.clone(), 2)
         }
         Err(je) if je.is_cancelled() => {
-            stderr.push_str("[killed by shsh kill]\n");
+            stderr.push_str("[killed by fern kill]\n");
             (parent_state.clone(), -1)
         }
         Err(e) => {
@@ -547,7 +547,7 @@ fn setup_pty(
 
     // Reader thread: PTY → broadcast events; signal EOF on close.
     std::thread::Builder::new()
-        .name(format!("shsh-pty-r-{cell_id}"))
+        .name(format!("fern-pty-r-{cell_id}"))
         .spawn(move || {
             use std::io::Read;
             let mut reader = master_reader;
@@ -570,7 +570,7 @@ fn setup_pty(
 
     // Writer thread: input channel → PTY stdin.
     std::thread::Builder::new()
-        .name(format!("shsh-pty-w-{cell_id}"))
+        .name(format!("fern-pty-w-{cell_id}"))
         .spawn(move || {
             use std::io::Write;
             let mut writer = master_writer;

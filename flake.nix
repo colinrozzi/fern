@@ -1,5 +1,5 @@
 {
-  description = "shsh — shared shell session";
+  description = "fern — shared shell session";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

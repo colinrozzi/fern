@@ -20,7 +20,7 @@ use crate::wire::{self, CellEvent, CellSnapshot, Request, Response, Stream, Tree
 
 fn cursor_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(base).join("shsh-cursor")
+    PathBuf::from(base).join("fern-cursor")
 }
 
 pub fn read_cursor() -> CellId {
@@ -188,7 +188,7 @@ pub async fn attach(id: CellId) -> Result<()> {
     // Make sure we always restore cooked mode on exit.
     let _guard = RawModeGuard;
 
-    eprintln!("[shsh] attached to cell #{id}. Ctrl+] to detach.\r");
+    eprintln!("[fern] attached to cell #{id}. Ctrl+] to detach.\r");
 
     // Reader: stdin → daemon Input requests. Detach on Ctrl+] (0x1d).
     let detach_signal = Arc::new(tokio::sync::Notify::new());
@@ -231,11 +231,11 @@ pub async fn attach(id: CellId) -> Result<()> {
                     stdout.flush().ok();
                 }
                 Response::Event(CellEvent::Completed { exit_code, .. }) => {
-                    eprintln!("\r\n[shsh] cell exited with code {exit_code}\r");
+                    eprintln!("\r\n[fern] cell exited with code {exit_code}\r");
                     return Ok::<_, anyhow::Error>(());
                 }
                 Response::Error { message } => {
-                    eprintln!("\r\n[shsh] error: {message}\r");
+                    eprintln!("\r\n[fern] error: {message}\r");
                     return Ok(());
                 }
                 _ => {}
@@ -247,7 +247,7 @@ pub async fn attach(id: CellId) -> Result<()> {
     tokio::select! {
         _ = event_task => {},
         _ = detach_signal_recv.notified() => {
-            eprintln!("\r\n[shsh] detached (cell still running)\r");
+            eprintln!("\r\n[fern] detached (cell still running)\r");
         }
     }
     stdin_task.abort();

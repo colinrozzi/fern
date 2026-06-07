@@ -22,7 +22,7 @@ pub enum Request {
         #[serde(default)]
         detach: bool,
         /// If true, the cell runs under a PTY (so isatty-aware programs see a
-        /// terminal). Required for `shsh attach`. v1 requires `detach=true`
+        /// terminal). Required for `fern attach`. v1 requires `detach=true`
         /// alongside this; you attach to the running cell from a separate client.
         #[serde(default)]
         interactive: bool,
@@ -109,5 +109,5 @@ pub struct TreeSnapshot {
 
 pub fn socket_path() -> std::path::PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(base).join("shsh.sock")
+    std::path::PathBuf::from(base).join("fern.sock")
 }

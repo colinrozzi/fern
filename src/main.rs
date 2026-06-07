@@ -9,7 +9,7 @@ mod wire;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "shsh", about = "shared shell session")]
+#[command(name = "fern", about = "shared shell session")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -28,11 +28,11 @@ enum Cmd {
         #[arg(short, long)]
         who: Option<String>,
         /// Start the cell in the background; return immediately with its id.
-        /// Output streams via `shsh watch`; terminate with `shsh kill <id>`.
+        /// Output streams via `fern watch`; terminate with `fern kill <id>`.
         #[arg(short, long)]
         detach: bool,
         /// Run the cell under a PTY (so isatty-aware programs see a terminal).
-        /// Required for `shsh attach`. Implies --detach.
+        /// Required for `fern attach`. Implies --detach.
         #[arg(short, long)]
         interactive: bool,
         /// Command line (joined with spaces)
@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
             if interactive || detach {
                 let id = client::submit_detached(parent, who, line, interactive).await?;
                 if interactive {
-                    println!("interactive: cell #{id} running; attach with `shsh attach {id}`");
+                    println!("interactive: cell #{id} running; attach with `fern attach {id}`");
                 } else {
                     println!("detached: cell #{id} running");
                 }

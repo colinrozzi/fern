@@ -172,7 +172,7 @@ async fn eval_pipeline(
         }
         p.stderr(Stdio::piped());
         // Kill the child if its future is dropped (e.g. detached cell aborted
-        // via `shsh kill`, or client disconnected mid-eval). Otherwise children
+        // via `fern kill`, or client disconnected mid-eval). Otherwise children
         // would orphan and stream-readers would hang on still-live pipes.
         p.kill_on_drop(true);
 
@@ -494,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_out_then_in() {
-        let tmp = std::env::temp_dir().join(format!("shsh-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("fern-test-{}", std::process::id()));
         let path = tmp.to_str().unwrap();
         let line_out = format!("echo redirected > {path}");
         let (_s, o) = eval_line_collect(&st(), &line_out).await.unwrap();
