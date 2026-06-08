@@ -10,7 +10,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::AbortHandle;
 
-use crate::tree::{Cell, CellId, CellResult, State, Tree};
+use crate::tree::{Cell, CellId, CellResult, State, SystemInfo, Tree};
 use crate::wire::{CellEvent, CellSnapshot, Request, Response, Stream, TreeSnapshot, socket_path};
 
 struct DaemonState {
@@ -41,11 +41,18 @@ pub async fn run() -> Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener =
         UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
-    eprintln!("fern daemon listening on {}", path.display());
+
+    let sysinfo = SystemInfo::collect();
+    eprintln!(
+        "fern daemon listening on {} (host={} fern v{})",
+        path.display(),
+        sysinfo.hostname,
+        sysinfo.fern_version
+    );
 
     let (events, _) = broadcast::channel(4096);
     let state = Arc::new(DaemonState {
-        tree: Mutex::new(Tree::new(State::baseline()?)),
+        tree: Mutex::new(Tree::new(State::baseline()?, sysinfo)),
         events,
         active: Mutex::new(HashMap::new()),
     });
@@ -209,6 +216,7 @@ async fn handle_submit(
                     parent: Some(parent),
                     submitter: who.clone(),
                     source: source.clone(),
+                    hash: None,
                     result: None,
                 },
             );
@@ -292,6 +300,7 @@ async fn run_inline(
         parent: Some(parent),
         submitter: who,
         source,
+        hash: None,
         result: Some(CellResult {
             exit_code,
             stdout: stdout.into_bytes(),
@@ -300,14 +309,16 @@ async fn run_inline(
             end_state: new_state,
         }),
     };
-    {
+    let hash = {
         let mut t = state.tree.lock().await;
         t.insert_cell(parent, cell);
-    }
+        t.get(cell_id).and_then(|c| c.hash.clone())
+    };
     let completed = CellEvent::Completed {
         id: cell_id,
         exit_code,
         duration_ms: duration.as_millis() as u64,
+        hash,
     };
     let _ = state.events.send(completed.clone());
     send(wr, &Response::Event(completed)).await?;
@@ -372,7 +383,7 @@ async fn run_detached(
     };
     let duration = started.elapsed();
 
-    {
+    let hash = {
         let mut t = state.tree.lock().await;
         t.set_cell_result(
             cell_id,
@@ -384,13 +395,15 @@ async fn run_detached(
                 end_state: new_state,
             },
         );
-    }
+        t.get(cell_id).and_then(|c| c.hash.clone())
+    };
     state.active.lock().await.remove(&cell_id);
 
     let _ = state.events.send(CellEvent::Completed {
         id: cell_id,
         exit_code,
         duration_ms: duration.as_millis() as u64,
+        hash,
     });
 }
 
@@ -414,6 +427,7 @@ async fn spawn_interactive_detached(
                 parent: Some(parent),
                 submitter: who,
                 source: source.clone(),
+                hash: None,
                 result: None,
             },
         );
@@ -424,21 +438,25 @@ async fn spawn_interactive_detached(
     let (input_tx, child, eof_rx) = match pty_setup {
         Ok(x) => x,
         Err(e) => {
-            let mut t = state.tree.lock().await;
-            t.set_cell_result(
-                cell_id,
-                CellResult {
-                    exit_code: 2,
-                    stdout: vec![],
-                    stderr: format!("pty setup: {e}\n").into_bytes(),
-                    duration: Duration::ZERO,
-                    end_state: parent_state.clone(),
-                },
-            );
+            let hash = {
+                let mut t = state.tree.lock().await;
+                t.set_cell_result(
+                    cell_id,
+                    CellResult {
+                        exit_code: 2,
+                        stdout: vec![],
+                        stderr: format!("pty setup: {e}\n").into_bytes(),
+                        duration: Duration::ZERO,
+                        end_state: parent_state.clone(),
+                    },
+                );
+                t.get(cell_id).and_then(|c| c.hash.clone())
+            };
             let _ = state.events.send(CellEvent::Completed {
                 id: cell_id,
                 exit_code: 2,
                 duration_ms: 0,
+                hash,
             });
             return Ok(());
         }
@@ -469,7 +487,7 @@ async fn spawn_interactive_detached(
         };
         let duration = started.elapsed();
 
-        {
+        let hash = {
             let mut t = state_clone.tree.lock().await;
             t.set_cell_result(
                 cell_id,
@@ -481,13 +499,15 @@ async fn spawn_interactive_detached(
                     end_state: parent_state_clone,
                 },
             );
-        }
+            t.get(cell_id).and_then(|c| c.hash.clone())
+        };
         state_clone.active.lock().await.remove(&cell_id);
 
         let _ = state_clone.events.send(CellEvent::Completed {
             id: cell_id,
             exit_code,
             duration_ms: duration.as_millis() as u64,
+            hash,
         });
     });
 
@@ -732,6 +752,7 @@ fn snapshot_cell(c: &Cell) -> CellSnapshot {
         stderr: r
             .map(|r| String::from_utf8_lossy(&r.stderr).into_owned())
             .unwrap_or_default(),
+        hash: c.hash.clone(),
     }
 }
 

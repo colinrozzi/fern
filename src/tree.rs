@@ -1,9 +1,14 @@
 //! Core types: State, Process, Cell, and the Tree that holds them.
 //!
-//! Cells form a tree. Each cell takes a parent `State`, evaluates one command
-//! line, and produces a new `State` (cwd + env after it ran).
+//! Cells form a Merkle DAG. Each cell takes a parent `State`, evaluates one
+//! command line, and produces a new `State` + structured Output. On completion,
+//! the cell is content-addressed: `hash(parent_hash, source, submitter, stdout,
+//! stderr, exit_code, end_state)`. The root cell's hash baselines the machine
+//! via `SystemInfo` (os, arch, hostname, fern version) — so every descendant's
+//! hash transitively encodes "this happened on *that* machine in *that* state".
 
 use anyhow::{Result, anyhow};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -58,9 +63,39 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 
+// ---------- SystemInfo (baseline for the root cell's hash) -------------
+
+#[derive(Debug, Clone)]
+pub struct SystemInfo {
+    pub os: String,
+    pub arch: String,
+    pub hostname: String,
+    pub fern_version: String,
+}
+
+impl SystemInfo {
+    pub fn collect() -> Self {
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "unknown".into());
+        Self {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            hostname,
+            fern_version: env!("CARGO_PKG_VERSION").into(),
+        }
+    }
+}
+
 // ---------- Cell tree ---------------------------------------------------
 
 pub type CellId = u64;
+
+/// Hex-encoded SHA-256 of the cell's content. Cryptographic identity.
+pub type Hash = String;
 
 #[derive(Debug, Clone)]
 pub struct Cell {
@@ -70,6 +105,9 @@ pub struct Cell {
     /// The command line as the user typed it. Empty for the root cell.
     pub source: String,
     pub result: Option<CellResult>,
+    /// Content hash. None while the cell is still running; Some after the
+    /// result has been recorded.
+    pub hash: Option<Hash>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,8 +127,10 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// Create a tree rooted at a synthetic cell #0 holding the baseline state.
-    pub fn new(root_state: State) -> Self {
+    /// Create a tree rooted at a synthetic cell #0. The root's hash bakes in
+    /// the SystemInfo so every descendant inherits this machine's lineage.
+    pub fn new(root_state: State, sysinfo: SystemInfo) -> Self {
+        let root_hash = hash_root(&sysinfo, &root_state);
         let mut cells = HashMap::new();
         cells.insert(
             0,
@@ -106,6 +146,7 @@ impl Tree {
                     duration: std::time::Duration::ZERO,
                     end_state: root_state,
                 }),
+                hash: Some(root_hash),
             },
         );
         let mut children = HashMap::new();
@@ -134,28 +175,36 @@ impl Tree {
     }
 
     /// Insert a fully-built cell (with a previously-reserved id) under `parent`.
-    pub fn insert_cell(&mut self, parent: CellId, cell: Cell) {
+    /// Computes the cell's content hash before insertion.
+    pub fn insert_cell(&mut self, parent: CellId, mut cell: Cell) {
+        let parent_hash = self.cells.get(&parent).and_then(|p| p.hash.clone());
+        cell.hash = Some(hash_cell(&cell, parent_hash.as_deref()));
         let id = cell.id;
         self.cells.insert(id, cell);
         self.children.entry(parent).or_default().push(id);
         self.children.entry(id).or_default();
     }
 
-    /// Attach (or replace) the result of a cell previously inserted with `result: None`.
-    /// Used for detached cells whose result lands later (or on kill).
+    /// Attach (or replace) the result of a cell previously inserted with
+    /// `result: None`. Computes and stores the content hash.
     pub fn set_cell_result(&mut self, id: CellId, result: CellResult) {
+        let parent_hash = self
+            .cells
+            .get(&id)
+            .and_then(|c| c.parent)
+            .and_then(|p| self.cells.get(&p))
+            .and_then(|p| p.hash.clone());
         if let Some(cell) = self.cells.get_mut(&id) {
             cell.result = Some(result);
+            cell.hash = Some(hash_cell(cell, parent_hash.as_deref()));
         }
     }
 
-    /// Parse and evaluate `source` as a child of `parent`. Returns the new cell id.
-    /// Parse and runtime errors become a cell with exit_code 2 and the error
-    /// text on stderr, so the tree always advances.
+    /// Parse, evaluate, and insert `source` as a child of `parent`. Returns
+    /// the new cell id.
     ///
     /// The daemon doesn't use this — it does reserve_id + streaming eval +
-    /// insert_cell so the tree mutex isn't held across eval. Kept for tests
-    /// and any future single-threaded caller.
+    /// insert_cell so the tree mutex isn't held across eval. Kept for tests.
     #[allow(dead_code)]
     pub async fn submit(
         &mut self,
@@ -173,8 +222,6 @@ impl Tree {
             .end_state
             .clone();
 
-        let id = self.next_id;
-        self.next_id += 1;
         let started = Instant::now();
 
         let (new_state, output) = match crate::eval::eval_line_collect(&parent_state, &source).await
@@ -190,28 +237,83 @@ impl Tree {
             ),
         };
 
-        let result = CellResult {
-            exit_code: output.exit_code,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            duration: started.elapsed(),
-            end_state: new_state,
-        };
-
-        self.cells.insert(
+        let id = self.reserve_id();
+        let cell = Cell {
             id,
-            Cell {
-                id,
-                parent: Some(parent),
-                submitter,
-                source,
-                result: Some(result),
-            },
-        );
-        self.children.entry(parent).or_default().push(id);
-        self.children.entry(id).or_default();
+            parent: Some(parent),
+            submitter,
+            source,
+            result: Some(CellResult {
+                exit_code: output.exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                duration: started.elapsed(),
+                end_state: new_state,
+            }),
+            hash: None, // insert_cell fills this in
+        };
+        self.insert_cell(parent, cell);
         Ok(id)
     }
+}
+
+// ---------- Hash functions ---------------------------------------------
+
+fn h_str(h: &mut Sha256, s: &str) {
+    h.update((s.len() as u64).to_le_bytes());
+    h.update(s.as_bytes());
+}
+
+fn h_bytes(h: &mut Sha256, b: &[u8]) {
+    h.update((b.len() as u64).to_le_bytes());
+    h.update(b);
+}
+
+fn h_state(h: &mut Sha256, state: &State) {
+    h_str(h, &state.cwd.to_string_lossy());
+    h.update((state.env.len() as u64).to_le_bytes());
+    for (k, v) in &state.env {
+        h_str(h, k);
+        h_str(h, v);
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// Root cell hash: machine + starting state. Domain-separated from regular
+/// cells so a regular cell can't accidentally collide with a root.
+fn hash_root(info: &SystemInfo, state: &State) -> Hash {
+    let mut h = Sha256::new();
+    h.update(b"FERN_ROOT_V1\0");
+    h_str(&mut h, &info.os);
+    h_str(&mut h, &info.arch);
+    h_str(&mut h, &info.hostname);
+    h_str(&mut h, &info.fern_version);
+    h_state(&mut h, state);
+    to_hex(&h.finalize())
+}
+
+/// Cell hash: parent_hash + recipe + outputs + end_state. Only meaningful
+/// when the cell has a result (still-running cells have no hash).
+fn hash_cell(cell: &Cell, parent_hash: Option<&str>) -> Hash {
+    let mut h = Sha256::new();
+    h.update(b"FERN_CELL_V1\0");
+    h_str(&mut h, parent_hash.unwrap_or(""));
+    h_str(&mut h, &cell.source);
+    h_str(&mut h, &cell.submitter);
+    if let Some(r) = &cell.result {
+        h_bytes(&mut h, &r.stdout);
+        h_bytes(&mut h, &r.stderr);
+        h.update(r.exit_code.to_le_bytes());
+        h_state(&mut h, &r.end_state);
+    }
+    to_hex(&h.finalize())
 }
 
 // ---------- Tests --------------------------------------------------------
@@ -219,6 +321,15 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sys() -> SystemInfo {
+        SystemInfo {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            hostname: "test-host".into(),
+            fern_version: "0.0.0".into(),
+        }
+    }
 
     async fn run(t: &mut Tree, parent: CellId, line: &str) -> CellId {
         t.submit(parent, "test".into(), line.into()).await.unwrap()
@@ -247,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn cwd_persists_across_cells() {
-        let mut t = Tree::new(State::baseline().unwrap());
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
         let a = run(&mut t, 0, "cd /tmp").await;
         let b = run(&mut t, a, "pwd").await;
         assert_eq!(cwd(&t, a), PathBuf::from("/tmp"));
@@ -256,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_persists_to_children() {
-        let mut t = Tree::new(State::baseline().unwrap());
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
         let a = run(&mut t, 0, "export FOO=bar").await;
         let b = run(&mut t, a, "printenv FOO").await;
         assert_eq!(env_of(&t, a, "FOO").as_deref(), Some("bar"));
@@ -265,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn branches_are_independent() {
-        let mut t = Tree::new(State::baseline().unwrap());
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
         let root = run(&mut t, 0, "export FOO=root").await;
         let a1 = run(&mut t, root, "export FOO=branchA").await;
         let a2 = run(&mut t, a1, "printenv FOO").await;
@@ -277,10 +388,95 @@ mod tests {
 
     #[tokio::test]
     async fn shell_features_work_in_cells() {
-        let mut t = Tree::new(State::baseline().unwrap());
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
         let a = run(&mut t, 0, "echo hello | wc -c").await;
         assert_eq!(out(&t, a).trim(), "6"); // "hello\n" = 6 bytes
         let b = run(&mut t, 0, "false || echo recovered").await;
         assert_eq!(out(&t, b).trim(), "recovered");
+    }
+
+    // ---------- Hash tests --------------------------------------------
+
+    #[tokio::test]
+    async fn cells_get_a_hash_on_completion() {
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
+        let id = run(&mut t, 0, "echo hi").await;
+        let cell = t.get(id).unwrap();
+        let hash = cell.hash.as_ref().unwrap();
+        assert_eq!(hash.len(), 64, "SHA-256 hex is 64 chars");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn root_hash_changes_with_machine() {
+        let state = State::baseline().unwrap();
+        let info_a = SystemInfo {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            hostname: "machine-a".into(),
+            fern_version: "0.0.0".into(),
+        };
+        let info_b = SystemInfo {
+            hostname: "machine-b".into(),
+            ..info_a.clone()
+        };
+        let tree_a = Tree::new(state.clone(), info_a);
+        let tree_b = Tree::new(state, info_b);
+        assert_ne!(
+            tree_a.get(0).unwrap().hash,
+            tree_b.get(0).unwrap().hash,
+            "different hostnames produce different root hashes"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_runs_collide_dedup_by_design() {
+        // Two `true` cells off the same parent should hash identically:
+        // same parent, same recipe, same (empty) output, same end-state.
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
+        let a = run(&mut t, 0, "true").await;
+        let b = run(&mut t, 0, "true").await;
+        let ha = t.get(a).unwrap().hash.clone().unwrap();
+        let hb = t.get(b).unwrap().hash.clone().unwrap();
+        assert_eq!(ha, hb, "identical work hashes identically");
+    }
+
+    #[tokio::test]
+    async fn different_output_changes_hash() {
+        // Two cells with the same recipe but different output should differ.
+        // `echo $RANDOM` would do it but we can't easily compare values; use
+        // different commands instead.
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
+        let a = run(&mut t, 0, "echo a").await;
+        let b = run(&mut t, 0, "echo b").await;
+        assert_ne!(t.get(a).unwrap().hash, t.get(b).unwrap().hash);
+    }
+
+    #[tokio::test]
+    async fn hash_chain_propagates() {
+        // Child's hash transitively depends on root's hash, so changing the
+        // machine baseline changes EVERY descendant's hash.
+        let state = State::baseline().unwrap();
+        let mut t_a = Tree::new(
+            state.clone(),
+            SystemInfo {
+                hostname: "host-a".into(),
+                ..sys()
+            },
+        );
+        let mut t_b = Tree::new(
+            state,
+            SystemInfo {
+                hostname: "host-b".into(),
+                ..sys()
+            },
+        );
+        let id_a = run(&mut t_a, 0, "echo same").await;
+        let id_b = run(&mut t_b, 0, "echo same").await;
+        assert_ne!(
+            t_a.get(id_a).unwrap().hash,
+            t_b.get(id_b).unwrap().hash,
+            "same command on different machines hashes differently"
+        );
     }
 }

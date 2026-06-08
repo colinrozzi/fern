@@ -140,8 +140,13 @@ fn print_tree(snap: &TreeSnapshot, cursor: CellId) {
                     Some(code) => format!("exit {code}"),
                     None => "running".into(),
                 };
+                let short_hash = c
+                    .hash
+                    .as_deref()
+                    .map(|h| format!(" {}", &h[..h.len().min(7)]))
+                    .unwrap_or_default();
                 println!(
-                    "{indent}#{} {} [{}] {status}{marker}",
+                    "{indent}#{}{short_hash} {} [{}] {status}{marker}",
                     c.id, src, c.submitter
                 );
                 walk(children, Some(c.id), depth + 1, cursor);

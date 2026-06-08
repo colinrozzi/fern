@@ -86,6 +86,10 @@ pub enum CellEvent {
         id: CellId,
         exit_code: i32,
         duration_ms: u64,
+        /// SHA-256 content hash. Optional for backward compat / partial updates;
+        /// the daemon always sets it for cells that produced a result.
+        #[serde(default)]
+        hash: Option<String>,
     },
 }
 
@@ -100,6 +104,9 @@ pub struct CellSnapshot {
     pub duration_ms: u64,
     pub stdout: String,
     pub stderr: String,
+    /// SHA-256 content hash. `None` while running, `Some(hex)` after Completed.
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

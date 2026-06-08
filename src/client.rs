@@ -100,6 +100,7 @@ where
                 id,
                 exit_code,
                 duration_ms,
+                hash,
             }) => {
                 return Ok(CellSnapshot {
                     id,
@@ -110,6 +111,7 @@ where
                     duration_ms,
                     stdout,
                     stderr,
+                    hash,
                 });
             }
             Response::Error { message } => return Err(anyhow!(message)),
@@ -391,8 +393,13 @@ fn render(ev: &CellEvent) {
             id,
             exit_code,
             duration_ms,
+            hash,
         } => {
-            println!("[#{id}] exit {exit_code} ({duration_ms}ms)");
+            let short = hash
+                .as_deref()
+                .map(|h| format!(" {}", &h[..h.len().min(7)]))
+                .unwrap_or_default();
+            println!("[#{id}{short}] exit {exit_code} ({duration_ms}ms)");
         }
     }
 }
@@ -420,7 +427,15 @@ fn render_tree(snap: &wire::TreeSnapshot) {
                     Some(code) => format!("exit {code}"),
                     None => "running".to_string(),
                 };
-                println!("{indent}#{} {} [{}] {status}", c.id, src, c.submitter);
+                let short_hash = c
+                    .hash
+                    .as_deref()
+                    .map(|h| format!(" {}", &h[..h.len().min(7)]))
+                    .unwrap_or_default();
+                println!(
+                    "{indent}#{}{short_hash} {} [{}] {status}",
+                    c.id, src, c.submitter
+                );
                 walk(children, Some(c.id), depth + 1);
             }
         }
