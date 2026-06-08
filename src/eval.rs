@@ -123,11 +123,24 @@ async fn eval_command(
             Ok((ns, 0))
         }
         _ => {
+            // I/O mode is inherited environment: a cell whose state carries
+            // FERN_IO=tty runs external commands under a PTY (so isatty-aware
+            // programs see a terminal). Redirects fall back to the pipe path.
+            if tty_mode(state) && c.redirects.is_empty() {
+                let exit = exec_under_pty(&argv, state, cell_id, events).await?;
+                return Ok((state.clone(), exit));
+            }
             let proc = Process::from_state(state, argv);
             let exit = exec_with_redirects(&proc, &c.redirects, state, cell_id, events).await?;
             Ok((state.clone(), exit))
         }
     }
+}
+
+/// True when the inherited environment asks for a terminal (`FERN_IO=tty`).
+/// Mode is configuration carried by the branch, not a per-cell flag.
+fn tty_mode(state: &State) -> bool {
+    state.env.get("FERN_IO").map(|v| v == "tty").unwrap_or(false)
 }
 
 async fn eval_pipeline(
@@ -322,6 +335,75 @@ async fn exec_with_redirects(
     Ok(status.code().unwrap_or(-1))
 }
 
+/// Run a single external command under a fresh PTY, streaming its (terminal)
+/// output as OutputChunk events. The caller accumulates those chunks into the
+/// cell's result, so PTY output is captured and content-addressed like any
+/// other cell. State is unchanged (a subprocess's cwd/env die with it).
+///
+/// Phase 1: no stdin wiring — programs that read input will block until killed.
+/// Attaching input to a running PTY cell is a follow-up.
+async fn exec_under_pty(
+    argv: &[String],
+    state: &State,
+    cell_id: CellId,
+    events: &mpsc::Sender<CellEvent>,
+) -> Result<i32> {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let pair = native_pty_system().openpty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new(&argv[0]);
+    for a in &argv[1..] {
+        cmd.arg(a);
+    }
+    cmd.cwd(state.cwd.clone());
+    for (k, v) in &state.env {
+        cmd.env(k, v);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| anyhow!("spawn {}: {e}", argv[0]))?;
+    let reader = pair.master.try_clone_reader()?;
+    drop(pair.slave); // so the master sees EOF once the child exits
+
+    // Reader thread: PTY master → OutputChunk events (captured by the caller).
+    let tx = events.clone();
+    let reader_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let _ = tx.blocking_send(CellEvent::OutputChunk {
+                        id: cell_id,
+                        stream: Stream::Stdout,
+                        data,
+                    });
+                }
+            }
+        }
+    });
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .map_err(|e| anyhow!("pty wait join: {e}"))?
+        .map_err(|e| anyhow!("pty wait: {e}"))?;
+    let _ = reader_thread.join();
+    drop(pair.master);
+
+    Ok(status.exit_code() as i32)
+}
+
 async fn open_for_write(path: &str, op: RedirOp) -> Result<File> {
     match op {
         RedirOp::Out => File::create(path)
@@ -512,6 +594,28 @@ mod tests {
         assert_eq!(out_str(&o).trim(), "redirected");
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn pipe_mode_is_not_a_tty() {
+        // Default (no FERN_IO): external commands run under pipes.
+        let (_s, o) = eval_line_collect(&st(), "tty").await.unwrap();
+        assert_ne!(o.exit_code, 0);
+        assert!(
+            out_str(&o).to_lowercase().contains("not a tty"),
+            "got: {:?}",
+            out_str(&o)
+        );
+    }
+
+    #[tokio::test]
+    async fn tty_mode_gives_a_terminal() {
+        // FERN_IO=tty in the inherited env makes the command see a real terminal.
+        let mut s = st();
+        s.env.insert("FERN_IO".into(), "tty".into());
+        let (_s, o) = eval_line_collect(&s, "tty").await.unwrap();
+        assert_eq!(o.exit_code, 0, "tty should report a terminal; got: {o:?}");
+        assert!(out_str(&o).contains("/dev/"), "got: {:?}", out_str(&o));
     }
 
     #[tokio::test]
