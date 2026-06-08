@@ -84,7 +84,6 @@ where
             source: source.clone(),
             who: who.clone(),
             detach: false,
-            interactive: false,
         },
     )
     .await?;
@@ -153,7 +152,6 @@ pub async fn submit_detached(
     parent: Option<CellId>,
     who: Option<String>,
     source: String,
-    interactive: bool,
 ) -> Result<CellId> {
     let who = who.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "?".into()));
     let branch = branch.unwrap_or_else(read_current_branch);
@@ -167,7 +165,6 @@ pub async fn submit_detached(
             source,
             who,
             detach: true,
-            interactive,
         },
     )
     .await?;
@@ -190,11 +187,26 @@ pub async fn submit_detached(
     Err(anyhow!("connection closed before Started event"))
 }
 
-/// Attach to a running interactive cell. Puts the terminal in raw mode so
-/// keys flow directly to the cell's PTY (Ctrl+]) detaches without killing.
-pub async fn attach(id: CellId) -> Result<()> {
+/// Resolve a target string to a cell id: a branch name → its current tip,
+/// otherwise a numeric cell id. Branch names win over numeric lookups.
+async fn resolve_target(target: &str) -> Result<CellId> {
+    let branches = fetch_branches().await?;
+    if let Some(b) = branches.iter().find(|b| b.name == target) {
+        return Ok(b.tip);
+    }
+    target
+        .parse::<CellId>()
+        .map_err(|_| anyhow!("no branch '{target}' and not a cell id"))
+}
+
+/// Attach to a running PTY cell at a branch's tip (or a cell id). Puts the
+/// terminal in raw mode so keys flow to the cell's PTY; Ctrl+] detaches
+/// without killing.
+pub async fn attach(target: String) -> Result<()> {
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use tokio::io::AsyncReadExt;
+
+    let id = resolve_target(&target).await?;
 
     let mut stream = connect().await?;
     send_req(&mut stream, &Request::Attach { id }).await?;
@@ -290,6 +302,37 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
     }
+}
+
+/// Send one line of input to a running PTY cell (branch tip or cell id) without
+/// taking over the terminal. Scriptable, and the way a non-interactive client
+/// (e.g. an agent) feeds a waiting cell. A trailing newline is appended.
+pub async fn send(target: String, data: String) -> Result<()> {
+    let id = resolve_target(&target).await?;
+
+    let mut stream = connect().await?;
+    send_req(&mut stream, &Request::Attach { id }).await?;
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+
+    let first = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("daemon closed connection"))?;
+    match serde_json::from_str::<Response>(&first)? {
+        Response::Ok => {}
+        Response::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("expected Ok, got {other:?}")),
+    }
+
+    let mut payload = data;
+    payload.push('\n');
+    let req = Request::Input { id, data: payload };
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+    wr.flush().await?;
+    Ok(())
 }
 
 pub async fn kill(id: CellId) -> Result<()> {

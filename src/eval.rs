@@ -29,11 +29,21 @@ pub async fn eval_line(
     line: &str,
     cell_id: CellId,
     events: mpsc::Sender<CellEvent>,
+    pty_reg: Option<mpsc::UnboundedSender<PtyRegistration>>,
 ) -> Result<(State, i32)> {
     let Some(stmt) = parse::parse(line)? else {
         return Ok((state.clone(), 0));
     };
-    eval_stmt(state, &stmt, cell_id, &events).await
+    eval_stmt(state, &stmt, cell_id, &events, pty_reg.as_ref()).await
+}
+
+/// How a running PTY cell exposes its controls. `exec_under_pty` sends one of
+/// these up to the daemon (when a registrar is provided) so `attach`/`kill` can
+/// reach a still-running terminal cell: write to `input`, terminate via `killer`.
+pub struct PtyRegistration {
+    pub cell_id: CellId,
+    pub input: mpsc::UnboundedSender<Vec<u8>>,
+    pub killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 
 #[async_recursion::async_recursion]
@@ -42,26 +52,29 @@ async fn eval_stmt(
     stmt: &Stmt,
     cell_id: CellId,
     events: &mpsc::Sender<CellEvent>,
+    pty_reg: Option<&mpsc::UnboundedSender<PtyRegistration>>,
 ) -> Result<(State, i32)> {
     match stmt {
-        Stmt::Cmd(c) => eval_command(state, c, cell_id, events).await,
+        Stmt::Cmd(c) => eval_command(state, c, cell_id, events, pty_reg).await,
+        // Pipelines stay pipe-mode (a multi-stage pipeline isn't a single
+        // foreground terminal program), so they don't take a PTY registrar.
         Stmt::Pipe(cmds) => eval_pipeline(state, cmds, cell_id, events).await,
         Stmt::Seq(l, r) => {
-            let (s1, _e1) = eval_stmt(state, l, cell_id, events).await?;
-            eval_stmt(&s1, r, cell_id, events).await
+            let (s1, _e1) = eval_stmt(state, l, cell_id, events, pty_reg).await?;
+            eval_stmt(&s1, r, cell_id, events, pty_reg).await
         }
         Stmt::AndIf(l, r) => {
-            let (s1, e1) = eval_stmt(state, l, cell_id, events).await?;
+            let (s1, e1) = eval_stmt(state, l, cell_id, events, pty_reg).await?;
             if e1 == 0 {
-                eval_stmt(&s1, r, cell_id, events).await
+                eval_stmt(&s1, r, cell_id, events, pty_reg).await
             } else {
                 Ok((s1, e1))
             }
         }
         Stmt::OrIf(l, r) => {
-            let (s1, e1) = eval_stmt(state, l, cell_id, events).await?;
+            let (s1, e1) = eval_stmt(state, l, cell_id, events, pty_reg).await?;
             if e1 != 0 {
-                eval_stmt(&s1, r, cell_id, events).await
+                eval_stmt(&s1, r, cell_id, events, pty_reg).await
             } else {
                 Ok((s1, e1))
             }
@@ -74,6 +87,7 @@ async fn eval_command(
     c: &Command,
     cell_id: CellId,
     events: &mpsc::Sender<CellEvent>,
+    pty_reg: Option<&mpsc::UnboundedSender<PtyRegistration>>,
 ) -> Result<(State, i32)> {
     let argv: Vec<String> = c.words.iter().map(|w| expand_word(w, state)).collect();
     if argv.is_empty() {
@@ -127,7 +141,7 @@ async fn eval_command(
             // FERN_IO=tty runs external commands under a PTY (so isatty-aware
             // programs see a terminal). Redirects fall back to the pipe path.
             if tty_mode(state) && c.redirects.is_empty() {
-                let exit = exec_under_pty(&argv, state, cell_id, events).await?;
+                let exit = exec_under_pty(&argv, state, cell_id, events, pty_reg).await?;
                 return Ok((state.clone(), exit));
             }
             let proc = Process::from_state(state, argv);
@@ -150,7 +164,7 @@ async fn eval_pipeline(
     events: &mpsc::Sender<CellEvent>,
 ) -> Result<(State, i32)> {
     if cmds.len() == 1 {
-        return eval_command(state, &cmds[0], cell_id, events).await;
+        return eval_command(state, &cmds[0], cell_id, events, None).await;
     }
 
     let mut prev_stdout: Option<std::process::Stdio> = None;
@@ -340,13 +354,17 @@ async fn exec_with_redirects(
 /// cell's result, so PTY output is captured and content-addressed like any
 /// other cell. State is unchanged (a subprocess's cwd/env die with it).
 ///
-/// Phase 1: no stdin wiring — programs that read input will block until killed.
-/// Attaching input to a running PTY cell is a follow-up.
+/// When `pty_reg` is provided, the cell's stdin is wired to an input channel
+/// and an input sender + child killer are registered with the daemon, so a
+/// client can `attach`/`send`/`kill` the running terminal. Without it (the
+/// inline path) the command runs to completion with no stdin — a program that
+/// reads input will block.
 async fn exec_under_pty(
     argv: &[String],
     state: &State,
     cell_id: CellId,
     events: &mpsc::Sender<CellEvent>,
+    pty_reg: Option<&mpsc::UnboundedSender<PtyRegistration>>,
 ) -> Result<i32> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -371,6 +389,28 @@ async fn exec_under_pty(
         .spawn_command(cmd)
         .map_err(|e| anyhow!("spawn {}: {e}", argv[0]))?;
     let reader = pair.master.try_clone_reader()?;
+
+    // If a registrar is present, expose input + kill controls for this cell.
+    if let Some(reg) = pty_reg {
+        let writer = pair.master.take_writer()?;
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut writer = writer;
+            while let Some(bytes) = input_rx.blocking_recv() {
+                if writer.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        });
+        let _ = reg.send(PtyRegistration {
+            cell_id,
+            input: input_tx,
+            killer: child.clone_killer(),
+        });
+    }
+
     drop(pair.slave); // so the master sees EOF once the child exits
 
     // Reader thread: PTY master → OutputChunk events (captured by the caller).
@@ -477,7 +517,7 @@ pub async fn eval_line_collect(state: &State, line: &str) -> Result<(State, Outp
         }
         (stdout, stderr)
     };
-    let (res, (stdout, stderr)) = tokio::join!(eval_line(state, line, 0, tx), drain);
+    let (res, (stdout, stderr)) = tokio::join!(eval_line(state, line, 0, tx, None), drain);
     let (new_state, exit_code) = res?;
     Ok((
         new_state,

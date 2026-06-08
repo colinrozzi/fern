@@ -33,19 +33,19 @@ enum Cmd {
         who: Option<String>,
         /// Start the cell in the background; return immediately with its id.
         /// Output streams via `fern watch`; terminate with `fern kill <id>`.
+        /// On a `FERN_IO=tty` branch, a detached cell is attachable.
         #[arg(short, long)]
         detach: bool,
-        /// Run the cell under a PTY (so isatty-aware programs see a terminal).
-        /// Required for `fern attach`. Implies --detach.
-        #[arg(short, long)]
-        interactive: bool,
         /// Command line (joined with spaces)
         source: Vec<String>,
     },
     /// Kill a running detached cell
     Kill { id: u64 },
-    /// Attach to a running interactive cell (bidirectional: raw-mode terminal)
-    Attach { id: u64 },
+    /// Attach to a running PTY cell at a branch's tip (or a cell id):
+    /// bidirectional raw-mode terminal. Ctrl+] detaches without killing.
+    Attach { target: String },
+    /// Send one line of input to a running PTY cell (branch tip or cell id)
+    Send { target: String, data: Vec<String> },
     /// Tail every cell event from every client
     Watch,
     /// Dump the cell tree
@@ -81,18 +81,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon => daemon::run().await,
-        Cmd::Run { branch, parent, who, detach, interactive, source } => {
+        Cmd::Run { branch, parent, who, detach, source } => {
             let line = source.join(" ");
             if line.trim().is_empty() {
                 anyhow::bail!("no command");
             }
-            if interactive || detach {
-                let id = client::submit_detached(branch, parent, who, line, interactive).await?;
-                if interactive {
-                    println!("interactive: cell #{id} running; attach with `fern attach {id}`");
-                } else {
-                    println!("detached: cell #{id} running");
-                }
+            if detach {
+                let id = client::submit_detached(branch, parent, who, line).await?;
+                println!("detached: cell #{id} running");
                 Ok(())
             } else {
                 let code = client::run(branch, parent, who, line).await?;
@@ -100,7 +96,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Kill { id } => client::kill(id).await,
-        Cmd::Attach { id } => client::attach(id).await,
+        Cmd::Attach { target } => client::attach(target).await,
+        Cmd::Send { target, data } => client::send(target, data.join(" ")).await,
         Cmd::Watch => client::watch().await,
         Cmd::Tree => client::tree().await,
         Cmd::Branch { action } => match action {

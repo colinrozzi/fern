@@ -1,15 +1,15 @@
 //! Daemon: owns the cell tree, broadcasts CellEvents, serves requests over a
 //! unix socket. Supports inline, detached, and interactive (PTY-attached) cells.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::AbortHandle;
 
+use crate::eval::PtyRegistration;
 use crate::tree::{Cell, CellId, CellResult, State, SystemInfo, Tree};
 use crate::wire::{
     BranchSnapshot, CellEvent, CellSnapshot, Request, Response, Stream, TreeSnapshot, socket_path,
@@ -22,20 +22,19 @@ struct DaemonState {
 }
 
 struct ActiveCell {
-    /// Aborts the supervising task. For non-interactive cells this kills the
-    /// eval; for interactive cells the supervisor exits naturally once the
-    /// child does (or we kill the child explicitly).
+    /// Aborts the eval task. Used to kill pipe-mode cells; PTY cells are killed
+    /// via their `killer` instead (aborting the task wouldn't reap the child).
     abort: AbortHandle,
-    /// PTY-specific bits. None for non-interactive cells.
+    /// Present once a cell has spawned a PTY (a `FERN_IO=tty` external command
+    /// on a detached cell). Carries the stdin channel + child killer.
     pty: Option<PtyHandle>,
 }
 
 struct PtyHandle {
-    /// Sender for bytes to write to the PTY's slave stdin.
+    /// Sender for bytes to write to the PTY's stdin.
     input: mpsc::UnboundedSender<Vec<u8>>,
-    /// Child handle for explicit kill. Wrapped in std::sync::Mutex so we can
-    /// hold it across the blocking try_wait/kill calls.
-    child: std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// Kills the PTY child. Wrapped in a std Mutex so `kill` can take `&mut`.
+    killer: std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
 }
 
 pub async fn run() -> Result<()> {
@@ -98,10 +97,8 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
                 source,
                 who,
                 detach,
-                interactive,
             } => {
-                handle_submit(&state, branch, parent, source, who, detach, interactive, &mut wr)
-                    .await?;
+                handle_submit(&state, branch, parent, source, who, detach, &mut wr).await?;
             }
             Request::Subscribe => {
                 handle_subscribe(&state, &mut wr).await?;
@@ -229,7 +226,6 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
 
 // ---------- Submit (inline / detached / interactive+detached) ----------
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_submit(
     state: &Arc<DaemonState>,
     branch: String,
@@ -237,21 +233,8 @@ async fn handle_submit(
     source: String,
     who: String,
     detach: bool,
-    interactive: bool,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
-    if interactive && !detach {
-        send(
-            wr,
-            &Response::Error {
-                message: "--interactive currently requires --detach (attach from another client)"
-                    .into(),
-            },
-        )
-        .await?;
-        return Ok(());
-    }
-
     // Resolve parent + branch, reserve the id, advance-or-fork the branch, and
     // insert the placeholder cell — all under one lock, so the tip atomically
     // points at the new (still-running) cell the instant it exists.
@@ -333,11 +316,6 @@ async fn handle_submit(
     let _ = state.events.send(started_event.clone());
     send(wr, &Response::Event(started_event)).await?;
 
-    if interactive {
-        spawn_interactive_detached(state.clone(), cell_id, parent_state, source).await?;
-        return Ok(());
-    }
-
     if detach {
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -346,7 +324,9 @@ async fn handle_submit(
         return Ok(());
     }
 
-    // Inline non-interactive path.
+    // Inline path. (Inline cells aren't attachable; a `FERN_IO=tty` command run
+    // inline gets captured terminal output but no stdin — use --detach + attach
+    // for interactive programs.)
     run_inline(state, cell_id, parent_state, source, wr).await
 }
 
@@ -372,7 +352,8 @@ async fn run_inline(
     let started = std::time::Instant::now();
 
     let eval_state = parent_state.clone();
-    let eval_fut = async move { crate::eval::eval_line(&eval_state, &src, cell_id, chunk_tx).await };
+    let eval_fut =
+        async move { crate::eval::eval_line(&eval_state, &src, cell_id, chunk_tx, None).await };
 
     let events_broadcast = state.events.clone();
     let forward_fut = async {
@@ -453,12 +434,14 @@ async fn run_detached(
     source: String,
 ) {
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<CellEvent>(128);
+    let (reg_tx, mut reg_rx) = mpsc::unbounded_channel::<PtyRegistration>();
     let started = std::time::Instant::now();
 
     let eval_state = parent_state.clone();
     let src = source.clone();
-    let eval_handle =
-        tokio::spawn(async move { crate::eval::eval_line(&eval_state, &src, cell_id, chunk_tx).await });
+    let eval_handle = tokio::spawn(async move {
+        crate::eval::eval_line(&eval_state, &src, cell_id, chunk_tx, Some(reg_tx)).await
+    });
 
     state.active.lock().await.insert(
         cell_id,
@@ -467,6 +450,29 @@ async fn run_detached(
             pty: None,
         }),
     );
+
+    // If the cell spawns a PTY (FERN_IO=tty), fold its input + killer into the
+    // active entry so attach/send/kill can reach it. The channel closes when
+    // eval finishes, ending this task.
+    let reg_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(reg) = reg_rx.recv().await {
+            let mut active = reg_state.active.lock().await;
+            if let Some(existing) = active.get(&reg.cell_id) {
+                let abort = existing.abort.clone();
+                active.insert(
+                    reg.cell_id,
+                    Arc::new(ActiveCell {
+                        abort,
+                        pty: Some(PtyHandle {
+                            input: reg.input,
+                            killer: std::sync::Mutex::new(reg.killer),
+                        }),
+                    }),
+                );
+            }
+        }
+    });
 
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -528,186 +534,6 @@ async fn run_detached(
     });
 }
 
-// ---------- Interactive (PTY-backed, detached) -------------------------
-
-async fn spawn_interactive_detached(
-    state: Arc<DaemonState>,
-    cell_id: CellId,
-    parent_state: State,
-    source: String,
-) -> Result<()> {
-    let started = std::time::Instant::now();
-    let pty_setup = setup_pty(cell_id, &parent_state, &source, state.events.clone());
-    let (input_tx, child, eof_rx) = match pty_setup {
-        Ok(x) => x,
-        Err(e) => {
-            let hash = {
-                let mut t = state.tree.lock().await;
-                t.set_cell_result(
-                    cell_id,
-                    CellResult {
-                        exit_code: 2,
-                        stdout: vec![],
-                        stderr: format!("pty setup: {e}\n").into_bytes(),
-                        duration: Duration::ZERO,
-                        end_state: parent_state.clone(),
-                    },
-                );
-                t.get(cell_id).and_then(|c| c.hash.clone())
-            };
-            let _ = state.events.send(CellEvent::Completed {
-                id: cell_id,
-                exit_code: 2,
-                duration_ms: 0,
-                hash,
-            });
-            return Ok(());
-        }
-    };
-
-    let pty_handle = PtyHandle {
-        input: input_tx,
-        child: std::sync::Mutex::new(child),
-    };
-
-    // Supervisor: waits for PTY EOF, then reaps exit, updates tree, broadcasts Completed.
-    let state_clone = state.clone();
-    let parent_state_clone = parent_state.clone();
-    let supervisor = tokio::spawn(async move {
-        let _ = eof_rx.await; // PTY EOF — child has exited (or was killed)
-
-        // Reap the child exit code via try_wait on the child stored in active.
-        // We need to look up the active cell again to find the child handle.
-        let exit_code = {
-            let active_map = state_clone.active.lock().await;
-            let ac = active_map.get(&cell_id);
-            ac.and_then(|ac| ac.pty.as_ref())
-                .and_then(|pty| {
-                    let mut child = pty.child.lock().ok()?;
-                    child.try_wait().ok().flatten().map(|s| s.exit_code() as i32)
-                })
-                .unwrap_or(-1)
-        };
-        let duration = started.elapsed();
-
-        let hash = {
-            let mut t = state_clone.tree.lock().await;
-            t.set_cell_result(
-                cell_id,
-                CellResult {
-                    exit_code,
-                    stdout: vec![], // interactive output isn't captured (v1 limitation)
-                    stderr: vec![],
-                    duration,
-                    end_state: parent_state_clone,
-                },
-            );
-            t.get(cell_id).and_then(|c| c.hash.clone())
-        };
-        state_clone.active.lock().await.remove(&cell_id);
-
-        let _ = state_clone.events.send(CellEvent::Completed {
-            id: cell_id,
-            exit_code,
-            duration_ms: duration.as_millis() as u64,
-            hash,
-        });
-    });
-
-    state.active.lock().await.insert(
-        cell_id,
-        Arc::new(ActiveCell {
-            abort: supervisor.abort_handle(),
-            pty: Some(pty_handle),
-        }),
-    );
-
-    Ok(())
-}
-
-/// Open a PTY, spawn `bash -c <source>` on the slave, wire up reader/writer
-/// threads, and return:
-///   - input_tx: pump bytes here to write to the PTY's stdin
-///   - child: portable-pty Child handle (for kill)
-///   - eof_rx: fires when the PTY reader sees EOF (i.e. child has exited)
-fn setup_pty(
-    cell_id: CellId,
-    parent_state: &State,
-    source: &str,
-    events: broadcast::Sender<CellEvent>,
-) -> Result<(
-    mpsc::UnboundedSender<Vec<u8>>,
-    Box<dyn portable_pty::Child + Send + Sync>,
-    tokio::sync::oneshot::Receiver<()>,
-)> {
-    let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system.openpty(portable_pty::PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-
-    let mut cmd = portable_pty::CommandBuilder::new("bash");
-    cmd.arg("-c");
-    cmd.arg(source);
-    cmd.cwd(parent_state.cwd.clone());
-    for (k, v) in &parent_state.env {
-        cmd.env(k, v);
-    }
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| anyhow!("spawn bash: {e}"))?;
-    drop(pair.slave);
-
-    let master_reader = pair.master.try_clone_reader()?;
-    let master_writer = pair.master.take_writer()?;
-
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
-
-    // Reader thread: PTY → broadcast events; signal EOF on close.
-    std::thread::Builder::new()
-        .name(format!("fern-pty-r-{cell_id}"))
-        .spawn(move || {
-            use std::io::Read;
-            let mut reader = master_reader;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let data = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        let _ = events.send(CellEvent::OutputChunk {
-                            id: cell_id,
-                            stream: Stream::Stdout,
-                            data,
-                        });
-                    }
-                }
-            }
-            let _ = eof_tx.send(());
-        })?;
-
-    // Writer thread: input channel → PTY stdin.
-    std::thread::Builder::new()
-        .name(format!("fern-pty-w-{cell_id}"))
-        .spawn(move || {
-            use std::io::Write;
-            let mut writer = master_writer;
-            while let Some(bytes) = input_rx.blocking_recv() {
-                if writer.write_all(&bytes).is_err() {
-                    break;
-                }
-                let _ = writer.flush();
-            }
-        })?;
-
-    Ok((input_tx, child, eof_rx))
-}
-
 // ---------- Kill --------------------------------------------------------
 
 async fn handle_kill(
@@ -719,12 +545,12 @@ async fn handle_kill(
     match active {
         Some(ac) => {
             if let Some(pty) = &ac.pty {
-                // Interactive cell: signal the child. Supervisor will reap.
-                if let Ok(mut child) = pty.child.lock() {
-                    let _ = child.kill();
+                // PTY cell: kill the child; eval reaps it and records the result.
+                if let Ok(mut killer) = pty.killer.lock() {
+                    let _ = killer.kill();
                 }
             } else {
-                // Non-interactive: abort the eval task.
+                // Pipe cell: abort the eval task (kill_on_drop reaps children).
                 ac.abort.abort();
             }
             send(wr, &Response::Ok).await?;

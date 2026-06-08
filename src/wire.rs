@@ -25,14 +25,10 @@ pub enum Request {
         who: String,
         /// If true, daemon returns after the Started event and runs the cell
         /// in the background. Output streams via broadcast; tree shows the
-        /// cell with no exit_code until it completes (or is killed).
+        /// cell with no exit_code until it completes (or is killed). A cell on
+        /// a `FERN_IO=tty` branch run with detach is attachable (see `Attach`).
         #[serde(default)]
         detach: bool,
-        /// If true, the cell runs under a PTY (so isatty-aware programs see a
-        /// terminal). Required for `fern attach`. v1 requires `detach=true`
-        /// alongside this; you attach to the running cell from a separate client.
-        #[serde(default)]
-        interactive: bool,
     },
     Subscribe,
     GetTree,
