@@ -483,7 +483,8 @@ mod tests {
     #[tokio::test]
     async fn cd_builtin() {
         let (s, _o) = eval_line_collect(&st(), "cd /tmp").await.unwrap();
-        assert_eq!(s.cwd, PathBuf::from("/tmp"));
+        // `cd` canonicalizes, so on macOS /tmp resolves to /private/tmp.
+        assert_eq!(s.cwd, std::fs::canonicalize("/tmp").unwrap());
     }
 
     #[tokio::test]

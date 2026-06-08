@@ -1,8 +1,8 @@
 //! Interactive REPL — a thin frontend over the daemon's client API.
 //!
-//! No in-process tree; every submission goes to the daemon. The cursor lives
-//! in the shared XDG cursor file, so `fern run` invocations from other
-//! terminals stay in sync.
+//! No in-process tree; every submission goes to the daemon. The current branch
+//! lives in the shared XDG file, so `fern run` / `fern switch` from other
+//! terminals stay in sync. Each command extends the current branch's tip.
 
 use anyhow::{Result, anyhow};
 use std::io::Write;
@@ -13,7 +13,7 @@ use crate::tree::CellId;
 use crate::wire::{Stream, TreeSnapshot};
 
 pub async fn run() -> Result<()> {
-    let mut cursor: CellId = client::read_cursor();
+    let mut branch = client::read_current_branch();
 
     println!("fern repl — type :help for commands, :quit to exit");
 
@@ -21,7 +21,7 @@ pub async fn run() -> Result<()> {
     let mut lines = BufReader::new(stdin).lines();
 
     loop {
-        print!("(at #{cursor}) > ");
+        print!("(on {branch}) > ");
         std::io::stdout().flush().ok();
 
         let Some(line) = lines.next_line().await? else { break };
@@ -31,7 +31,7 @@ pub async fn run() -> Result<()> {
         }
 
         if let Some(rest) = trimmed.strip_prefix(':') {
-            match handle_meta(&mut cursor, rest).await {
+            match handle_meta(&mut branch, rest).await {
                 Ok(MetaResult::Continue) => {}
                 Ok(MetaResult::Quit) => break,
                 Err(e) => println!("error: {e}"),
@@ -40,8 +40,12 @@ pub async fn run() -> Result<()> {
         }
 
         let who = std::env::var("USER").unwrap_or_else(|_| "?".into());
-        match client::submit_streaming(Some(cursor), Some(who), trimmed.to_string(), |stream, data| {
-            match stream {
+        match client::submit_streaming(
+            Some(branch.clone()),
+            None,
+            Some(who),
+            trimmed.to_string(),
+            |stream, data| match stream {
                 Stream::Stdout => {
                     print!("{data}");
                     std::io::stdout().flush().ok();
@@ -50,8 +54,8 @@ pub async fn run() -> Result<()> {
                     eprint!("{data}");
                     std::io::stderr().flush().ok();
                 }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(snap) => {
@@ -69,7 +73,6 @@ pub async fn run() -> Result<()> {
                     None => "running".into(),
                 };
                 println!("[#{} {status} {}ms]", snap.id, snap.duration_ms);
-                cursor = snap.id;
             }
             Err(e) => println!("error: {e}"),
         }
@@ -82,40 +85,56 @@ enum MetaResult {
     Quit,
 }
 
-async fn handle_meta(cursor: &mut CellId, line: &str) -> Result<MetaResult> {
+async fn handle_meta(branch: &mut String, line: &str) -> Result<MetaResult> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let cmd = parts.first().copied().unwrap_or("");
     match cmd {
         "quit" | "q" | "exit" => return Ok(MetaResult::Quit),
         "help" | "h" | "" => {
-            println!(":tree            show the cell tree (from daemon)");
-            println!(":at              show current cursor");
-            println!(":cd <id>         move cursor to cell <id> (branch from there next)");
-            println!(":quit / :q       exit");
+            println!(":tree              show the cell tree (from daemon)");
+            println!(":branches          list branches");
+            println!(":switch <name>     switch the current branch");
+            println!(":at                show the current branch");
+            println!(":quit / :q         exit");
         }
-        "at" => println!("cursor at cell #{cursor}"),
-        "cd" => {
-            let id_str = parts.get(1).ok_or_else(|| anyhow!(":cd needs a cell id"))?;
-            let id: CellId = id_str.parse().map_err(|e| anyhow!("bad id: {e}"))?;
-            // Validate against the daemon's tree.
-            let snap = client::fetch_tree().await?;
-            if !snap.cells.iter().any(|c| c.id == id) {
-                return Err(anyhow!("no such cell #{id}"));
+        "at" => println!("on branch '{branch}'"),
+        "branches" => {
+            let branches = client::fetch_branches().await?;
+            for b in &branches {
+                let marker = if &b.name == branch { "*" } else { " " };
+                let state = if b.running {
+                    "running".to_string()
+                } else {
+                    b.tip_hash
+                        .as_deref()
+                        .map(|h| h[..h.len().min(7)].to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                };
+                println!("{marker} {} #{} {state}", b.name, b.tip);
             }
-            *cursor = id;
-            client::write_cursor(id);
-            println!("cursor moved to #{id}");
+        }
+        "switch" => {
+            let name = parts
+                .get(1)
+                .ok_or_else(|| anyhow!(":switch needs a branch name"))?;
+            let branches = client::fetch_branches().await?;
+            if !branches.iter().any(|b| b.name == *name) {
+                return Err(anyhow!("no such branch '{name}'"));
+            }
+            *branch = name.to_string();
+            client::write_current_branch(name);
+            println!("switched to '{name}'");
         }
         "tree" => {
             let snap = client::fetch_tree().await?;
-            print_tree(&snap, *cursor);
+            print_tree(&snap);
         }
         other => return Err(anyhow!("unknown meta command :{other} (try :help)")),
     }
     Ok(MetaResult::Continue)
 }
 
-fn print_tree(snap: &TreeSnapshot, cursor: CellId) {
+fn print_tree(snap: &TreeSnapshot) {
     use std::collections::HashMap;
     let mut children: HashMap<Option<CellId>, Vec<&crate::wire::CellSnapshot>> = HashMap::new();
     for c in &snap.cells {
@@ -125,7 +144,6 @@ fn print_tree(snap: &TreeSnapshot, cursor: CellId) {
         children: &HashMap<Option<CellId>, Vec<&crate::wire::CellSnapshot>>,
         parent: Option<CellId>,
         depth: usize,
-        cursor: CellId,
     ) {
         if let Some(cs) = children.get(&parent) {
             for c in cs {
@@ -135,7 +153,6 @@ fn print_tree(snap: &TreeSnapshot, cursor: CellId) {
                 } else {
                     c.source.clone()
                 };
-                let marker = if c.id == cursor { "  <-- cursor" } else { "" };
                 let status = match c.exit_code {
                     Some(code) => format!("exit {code}"),
                     None => "running".into(),
@@ -146,12 +163,12 @@ fn print_tree(snap: &TreeSnapshot, cursor: CellId) {
                     .map(|h| format!(" {}", &h[..h.len().min(7)]))
                     .unwrap_or_default();
                 println!(
-                    "{indent}#{}{short_hash} {} [{}] {status}{marker}",
+                    "{indent}#{}{short_hash} {} [{}] {status}",
                     c.id, src, c.submitter
                 );
-                walk(children, Some(c.id), depth + 1, cursor);
+                walk(children, Some(c.id), depth + 1);
             }
         }
     }
-    walk(&children, None, 0, cursor);
+    walk(&children, None, 0);
 }

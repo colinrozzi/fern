@@ -11,7 +11,9 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::AbortHandle;
 
 use crate::tree::{Cell, CellId, CellResult, State, SystemInfo, Tree};
-use crate::wire::{CellEvent, CellSnapshot, Request, Response, Stream, TreeSnapshot, socket_path};
+use crate::wire::{
+    BranchSnapshot, CellEvent, CellSnapshot, Request, Response, Stream, TreeSnapshot, socket_path,
+};
 
 struct DaemonState {
     tree: Mutex<Tree>,
@@ -91,13 +93,15 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
         };
         match req {
             Request::Submit {
+                branch,
                 parent,
                 source,
                 who,
                 detach,
                 interactive,
             } => {
-                handle_submit(&state, parent, source, who, detach, interactive, &mut wr).await?;
+                handle_submit(&state, branch, parent, source, who, detach, interactive, &mut wr)
+                    .await?;
             }
             Request::Subscribe => {
                 handle_subscribe(&state, &mut wr).await?;
@@ -107,6 +111,86 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
                 let t = state.tree.lock().await;
                 let snapshot = snapshot_tree(&t);
                 send(&mut wr, &Response::Tree(snapshot)).await?;
+            }
+            Request::ListBranches => {
+                let t = state.tree.lock().await;
+                send(
+                    &mut wr,
+                    &Response::Branches {
+                        branches: snapshot_branches(&t),
+                    },
+                )
+                .await?;
+            }
+            Request::CreateBranch { name, at } => {
+                let mut t = state.tree.lock().await;
+                if t.branch_exists(&name) {
+                    send(
+                        &mut wr,
+                        &Response::Error {
+                            message: format!("branch '{name}' already exists"),
+                        },
+                    )
+                    .await?;
+                } else if t.get(at).is_none() {
+                    send(
+                        &mut wr,
+                        &Response::Error {
+                            message: format!("no such cell #{at}"),
+                        },
+                    )
+                    .await?;
+                } else {
+                    t.set_branch(name, at);
+                    send(&mut wr, &Response::Ok).await?;
+                }
+            }
+            Request::DeleteBranch { name } => {
+                if name == crate::tree::DEFAULT_BRANCH {
+                    send(
+                        &mut wr,
+                        &Response::Error {
+                            message: format!("refusing to delete the default branch '{name}'"),
+                        },
+                    )
+                    .await?;
+                } else {
+                    let mut t = state.tree.lock().await;
+                    if t.delete_branch(&name) {
+                        send(&mut wr, &Response::Ok).await?;
+                    } else {
+                        send(
+                            &mut wr,
+                            &Response::Error {
+                                message: format!("no such branch '{name}'"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Request::RenameBranch { from, to } => {
+                let mut t = state.tree.lock().await;
+                if !t.branch_exists(&from) {
+                    send(
+                        &mut wr,
+                        &Response::Error {
+                            message: format!("no such branch '{from}'"),
+                        },
+                    )
+                    .await?;
+                } else if t.branch_exists(&to) {
+                    send(
+                        &mut wr,
+                        &Response::Error {
+                            message: format!("branch '{to}' already exists"),
+                        },
+                    )
+                    .await?;
+                } else {
+                    t.rename_branch(&from, &to);
+                    send(&mut wr, &Response::Ok).await?;
+                }
             }
             Request::GetCell { id } => {
                 let t = state.tree.lock().await;
@@ -145,9 +229,11 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
 
 // ---------- Submit (inline / detached / interactive+detached) ----------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_submit(
     state: &Arc<DaemonState>,
-    parent: CellId,
+    branch: String,
+    parent: Option<CellId>,
     source: String,
     who: String,
     detach: bool,
@@ -166,20 +252,46 @@ async fn handle_submit(
         return Ok(());
     }
 
-    let (cell_id, parent_state) = {
+    // Resolve parent + branch, reserve the id, advance-or-fork the branch, and
+    // insert the placeholder cell — all under one lock, so the tip atomically
+    // points at the new (still-running) cell the instant it exists.
+    let (cell_id, parent_cell, parent_state, landed_branch) = {
         let mut t = state.tree.lock().await;
-        let parent_state = match t.get(parent) {
-            Some(c) => c
-                .result
-                .as_ref()
-                .ok_or_else(|| anyhow!("parent #{parent} hasn't finished — can't branch yet"))?
-                .end_state
-                .clone(),
+        let tip = t.branch_tip(&branch);
+        let parent_cell = match parent.or(tip) {
+            Some(p) => p,
             None => {
                 send(
                     wr,
                     &Response::Error {
-                        message: format!("no such parent cell #{parent}"),
+                        message: format!("no such branch '{branch}' and no --parent given"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let parent_state = match t.get(parent_cell) {
+            Some(c) => match c.result.as_ref() {
+                Some(r) => r.end_state.clone(),
+                None => {
+                    send(
+                        wr,
+                        &Response::Error {
+                            message: format!(
+                                "parent #{parent_cell} hasn't finished — can't branch yet"
+                            ),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+            None => {
+                send(
+                    wr,
+                    &Response::Error {
+                        message: format!("no such parent cell #{parent_cell}"),
                     },
                 )
                 .await?;
@@ -187,40 +299,46 @@ async fn handle_submit(
             }
         };
         let id = t.reserve_id();
-        (id, parent_state)
+        // Fast-forward the branch when we're extending its current tip;
+        // otherwise the parent is historical, so fork onto a new branch.
+        let landed = if tip == Some(parent_cell) {
+            t.set_branch(&branch, id);
+            branch.clone()
+        } else {
+            let name = gen_fork_name(&t);
+            t.set_branch(&name, id);
+            name
+        };
+        t.insert_cell(
+            parent_cell,
+            Cell {
+                id,
+                parent: Some(parent_cell),
+                submitter: who.clone(),
+                source: source.clone(),
+                hash: None,
+                result: None,
+            },
+        );
+        (id, parent_cell, parent_state, landed)
     };
 
     let started_event = CellEvent::Started {
         id: cell_id,
-        parent: Some(parent),
+        parent: Some(parent_cell),
         source: source.clone(),
         who: who.clone(),
+        branch: landed_branch,
     };
     let _ = state.events.send(started_event.clone());
     send(wr, &Response::Event(started_event)).await?;
 
     if interactive {
-        spawn_interactive_detached(state.clone(), parent, cell_id, parent_state, source, who)
-            .await?;
+        spawn_interactive_detached(state.clone(), cell_id, parent_state, source).await?;
         return Ok(());
     }
 
     if detach {
-        // Insert placeholder cell with no result yet.
-        {
-            let mut t = state.tree.lock().await;
-            t.insert_cell(
-                parent,
-                Cell {
-                    id: cell_id,
-                    parent: Some(parent),
-                    submitter: who.clone(),
-                    source: source.clone(),
-                    hash: None,
-                    result: None,
-                },
-            );
-        }
         let state_clone = state.clone();
         tokio::spawn(async move {
             run_detached(state_clone, cell_id, parent_state, source).await;
@@ -229,16 +347,24 @@ async fn handle_submit(
     }
 
     // Inline non-interactive path.
-    run_inline(state, parent, cell_id, parent_state, source, who, wr).await
+    run_inline(state, cell_id, parent_state, source, wr).await
+}
+
+/// Pick a unique `fork-<uuid>` branch name not already in use.
+fn gen_fork_name(t: &Tree) -> String {
+    loop {
+        let name = format!("fork-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        if !t.branch_exists(&name) {
+            return name;
+        }
+    }
 }
 
 async fn run_inline(
     state: &Arc<DaemonState>,
-    parent: CellId,
     cell_id: CellId,
     parent_state: State,
     source: String,
-    who: String,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<CellEvent>(128);
@@ -295,23 +421,18 @@ async fn run_inline(
     }
     let duration = started.elapsed();
 
-    let cell = Cell {
-        id: cell_id,
-        parent: Some(parent),
-        submitter: who,
-        source,
-        hash: None,
-        result: Some(CellResult {
-            exit_code,
-            stdout: stdout.into_bytes(),
-            stderr: stderr.into_bytes(),
-            duration,
-            end_state: new_state,
-        }),
-    };
     let hash = {
         let mut t = state.tree.lock().await;
-        t.insert_cell(parent, cell);
+        t.set_cell_result(
+            cell_id,
+            CellResult {
+                exit_code,
+                stdout: stdout.into_bytes(),
+                stderr: stderr.into_bytes(),
+                duration,
+                end_state: new_state,
+            },
+        );
         t.get(cell_id).and_then(|c| c.hash.clone())
     };
     let completed = CellEvent::Completed {
@@ -411,28 +532,10 @@ async fn run_detached(
 
 async fn spawn_interactive_detached(
     state: Arc<DaemonState>,
-    parent: CellId,
     cell_id: CellId,
     parent_state: State,
     source: String,
-    who: String,
 ) -> Result<()> {
-    // Insert placeholder cell.
-    {
-        let mut t = state.tree.lock().await;
-        t.insert_cell(
-            parent,
-            Cell {
-                id: cell_id,
-                parent: Some(parent),
-                submitter: who,
-                source: source.clone(),
-                hash: None,
-                result: None,
-            },
-        );
-    }
-
     let started = std::time::Instant::now();
     let pty_setup = setup_pty(cell_id, &parent_state, &source, state.events.clone());
     let (input_tx, child, eof_rx) = match pty_setup {
@@ -754,6 +857,26 @@ fn snapshot_cell(c: &Cell) -> CellSnapshot {
             .unwrap_or_default(),
         hash: c.hash.clone(),
     }
+}
+
+fn snapshot_branches(t: &Tree) -> Vec<BranchSnapshot> {
+    t.branches()
+        .map(|(name, tip)| {
+            let cell = t.get(tip);
+            let running = cell.map(|c| c.result.is_none()).unwrap_or(false);
+            let tip_hash = if running {
+                None
+            } else {
+                cell.and_then(|c| c.hash.clone())
+            };
+            BranchSnapshot {
+                name: name.clone(),
+                tip,
+                tip_hash,
+                running,
+            }
+        })
+        .collect()
 }
 
 fn snapshot_tree(t: &Tree) -> TreeSnapshot {

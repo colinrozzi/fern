@@ -13,25 +13,34 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::tree::CellId;
-use crate::wire::{self, CellEvent, CellSnapshot, Request, Response, Stream, TreeSnapshot, socket_path};
+use crate::tree::{CellId, DEFAULT_BRANCH};
+use crate::wire::{
+    self, BranchSnapshot, CellEvent, CellSnapshot, Request, Response, Stream, TreeSnapshot,
+    socket_path,
+};
 
-// ---------- Cursor (shared across all clients on this host) ------------
+// ---------- Current branch (shared across all clients on this host) -----
+//
+// The "cursor" is now the name of the branch the next `fern run` extends.
+// It lives in a shared XDG file so all clients on this host agree on it, and
+// only changes via `fern switch` — running a command advances the branch's
+// tip on the daemon, not this file.
 
-fn cursor_path() -> PathBuf {
+fn current_branch_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(base).join("fern-cursor")
+    PathBuf::from(base).join("fern-branch")
 }
 
-pub fn read_cursor() -> CellId {
-    std::fs::read_to_string(cursor_path())
+pub fn read_current_branch() -> String {
+    std::fs::read_to_string(current_branch_path())
         .ok()
-        .and_then(|s| s.trim().parse::<CellId>().ok())
-        .unwrap_or(0)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_BRANCH.to_string())
 }
 
-pub fn write_cursor(id: CellId) {
-    let _ = std::fs::write(cursor_path(), id.to_string());
+pub fn write_current_branch(name: &str) {
+    let _ = std::fs::write(current_branch_path(), name);
 }
 
 // ---------- Low-level RPCs ---------------------------------------------
@@ -54,6 +63,7 @@ async fn send_req(stream: &mut UnixStream, req: &Request) -> Result<()> {
 /// Submit a command; invoke `on_chunk(stream, data)` for each OutputChunk as
 /// it streams in; return the final CellSnapshot when Completed.
 pub async fn submit_streaming<F>(
+    branch: Option<String>,
     parent: Option<CellId>,
     who: Option<String>,
     source: String,
@@ -63,12 +73,13 @@ where
     F: FnMut(Stream, &str),
 {
     let who = who.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "?".into()));
-    let parent = parent.unwrap_or_else(read_cursor);
+    let branch = branch.unwrap_or_else(read_current_branch);
 
     let mut stream = connect().await?;
     send_req(
         &mut stream,
         &Request::Submit {
+            branch: branch.clone(),
             parent,
             source: source.clone(),
             who: who.clone(),
@@ -82,12 +93,18 @@ where
     let mut lines = BufReader::new(rd).lines();
     let mut stdout = String::new();
     let mut stderr = String::new();
+    let mut cell_parent: Option<CellId> = None;
 
     while let Some(line) = lines.next_line().await? {
         let resp: Response = serde_json::from_str(&line)?;
         match resp {
-            Response::Event(CellEvent::Started { id, .. }) => {
-                write_cursor(id);
+            Response::Event(CellEvent::Started {
+                parent: p,
+                branch: landed,
+                ..
+            }) => {
+                cell_parent = p;
+                report_fork(&branch, &landed);
             }
             Response::Event(CellEvent::OutputChunk { stream: s, data, .. }) => {
                 on_chunk(s, &data);
@@ -104,7 +121,7 @@ where
             }) => {
                 return Ok(CellSnapshot {
                     id,
-                    parent: Some(parent),
+                    parent: cell_parent,
                     submitter: who,
                     source,
                     exit_code: Some(exit_code),
@@ -121,22 +138,31 @@ where
     Err(anyhow!("connection closed before Completed event"))
 }
 
+/// Tell the user when a submission forked instead of fast-forwarding.
+fn report_fork(requested: &str, landed: &str) {
+    if requested != landed {
+        eprintln!("[fern] forked off '{requested}' → new branch '{landed}'");
+    }
+}
+
 /// Submit a detached (long-running) cell. Returns the cell id as soon as the
 /// daemon sends Started; the cell runs in the background. Use `watch` to see
 /// output stream, `kill` to terminate it.
 pub async fn submit_detached(
+    branch: Option<String>,
     parent: Option<CellId>,
     who: Option<String>,
     source: String,
     interactive: bool,
 ) -> Result<CellId> {
     let who = who.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "?".into()));
-    let parent = parent.unwrap_or_else(read_cursor);
+    let branch = branch.unwrap_or_else(read_current_branch);
 
     let mut stream = connect().await?;
     send_req(
         &mut stream,
         &Request::Submit {
+            branch: branch.clone(),
             parent,
             source,
             who,
@@ -151,8 +177,10 @@ pub async fn submit_detached(
     while let Some(line) = lines.next_line().await? {
         let resp: Response = serde_json::from_str(&line)?;
         match resp {
-            Response::Event(CellEvent::Started { id, .. }) => {
-                write_cursor(id);
+            Response::Event(CellEvent::Started {
+                id, branch: landed, ..
+            }) => {
+                report_fork(&branch, &landed);
                 return Ok(id);
             }
             Response::Error { message } => return Err(anyhow!(message)),
@@ -285,11 +313,12 @@ pub async fn kill(id: CellId) -> Result<()> {
 /// the final snapshot.
 #[allow(dead_code)]
 pub async fn submit(
+    branch: Option<String>,
     parent: Option<CellId>,
     who: Option<String>,
     source: String,
 ) -> Result<CellSnapshot> {
-    submit_streaming(parent, who, source, |_, _| {}).await
+    submit_streaming(branch, parent, who, source, |_, _| {}).await
 }
 
 pub async fn fetch_tree() -> Result<TreeSnapshot> {
@@ -308,10 +337,48 @@ pub async fn fetch_tree() -> Result<TreeSnapshot> {
     Err(anyhow!("connection closed before Tree response"))
 }
 
+pub async fn fetch_branches() -> Result<Vec<BranchSnapshot>> {
+    let mut stream = connect().await?;
+    send_req(&mut stream, &Request::ListBranches).await?;
+    let (rd, _wr) = stream.split();
+    let mut lines = BufReader::new(rd).lines();
+    if let Some(line) = lines.next_line().await? {
+        let resp: Response = serde_json::from_str(&line)?;
+        match resp {
+            Response::Branches { branches } => return Ok(branches),
+            Response::Error { message } => return Err(anyhow!(message)),
+            other => return Err(anyhow!("unexpected: {other:?}")),
+        }
+    }
+    Err(anyhow!("connection closed before Branches response"))
+}
+
+/// Send a request that expects a bare `Ok`/`Error` reply.
+async fn send_expect_ok(req: &Request) -> Result<()> {
+    let mut stream = connect().await?;
+    send_req(&mut stream, req).await?;
+    let (rd, _wr) = stream.split();
+    let mut lines = BufReader::new(rd).lines();
+    if let Some(line) = lines.next_line().await? {
+        let resp: Response = serde_json::from_str(&line)?;
+        return match resp {
+            Response::Ok => Ok(()),
+            Response::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected: {other:?}")),
+        };
+    }
+    Err(anyhow!("connection closed before reply"))
+}
+
 // ---------- CLI verbs ---------------------------------------------------
 
-pub async fn run(parent: Option<CellId>, who: Option<String>, source: String) -> Result<i32> {
-    let snap = submit_streaming(parent, who, source, |stream, data| match stream {
+pub async fn run(
+    branch: Option<String>,
+    parent: Option<CellId>,
+    who: Option<String>,
+    source: String,
+) -> Result<i32> {
+    let snap = submit_streaming(branch, parent, who, source, |stream, data| match stream {
         Stream::Stdout => {
             use std::io::Write;
             print!("{data}");
@@ -352,6 +419,74 @@ pub async fn tree() -> Result<()> {
     Ok(())
 }
 
+// ---------- Branch verbs ------------------------------------------------
+
+pub async fn branch_list() -> Result<()> {
+    let branches = fetch_branches().await?;
+    render_branches(&branches, &read_current_branch());
+    Ok(())
+}
+
+pub async fn branch_new(name: String, at: Option<CellId>) -> Result<()> {
+    // Default the new branch's base to the current branch's tip.
+    let at = match at {
+        Some(id) => id,
+        None => {
+            let current = read_current_branch();
+            fetch_branches()
+                .await?
+                .into_iter()
+                .find(|b| b.name == current)
+                .map(|b| b.tip)
+                .ok_or_else(|| anyhow!("current branch '{current}' not found; pass --at <id>"))?
+        }
+    };
+    send_expect_ok(&Request::CreateBranch {
+        name: name.clone(),
+        at,
+    })
+    .await?;
+    println!("created branch '{name}' at #{at}");
+    Ok(())
+}
+
+pub async fn branch_rm(name: String) -> Result<()> {
+    send_expect_ok(&Request::DeleteBranch { name: name.clone() }).await?;
+    // If we deleted the branch we were on, fall back to the default.
+    if read_current_branch() == name {
+        write_current_branch(DEFAULT_BRANCH);
+        println!("deleted branch '{name}' (switched to '{DEFAULT_BRANCH}')");
+    } else {
+        println!("deleted branch '{name}'");
+    }
+    Ok(())
+}
+
+pub async fn branch_rename(from: String, to: String) -> Result<()> {
+    send_expect_ok(&Request::RenameBranch {
+        from: from.clone(),
+        to: to.clone(),
+    })
+    .await?;
+    if read_current_branch() == from {
+        write_current_branch(&to);
+    }
+    println!("renamed branch '{from}' → '{to}'");
+    Ok(())
+}
+
+pub async fn switch(name: String) -> Result<()> {
+    let branches = fetch_branches().await?;
+    if !branches.iter().any(|b| b.name == name) {
+        return Err(anyhow!(
+            "no such branch '{name}' (use `fern branch new {name}` to create it)"
+        ));
+    }
+    write_current_branch(&name);
+    println!("switched to branch '{name}'");
+    Ok(())
+}
+
 // ---------- Rendering helpers ------------------------------------------
 
 fn ensure_trailing_newline(stdout: &str, stderr: &str) {
@@ -371,11 +506,12 @@ fn render(ev: &CellEvent) {
             parent,
             source,
             who,
+            branch,
         } => {
             let parent = parent
                 .map(|p| format!("from #{p}"))
                 .unwrap_or_else(|| "root".into());
-            println!("\n[#{id} {who} {parent}] $ {source}");
+            println!("\n[#{id} {who} {parent} on {branch}] $ {source}");
         }
         CellEvent::OutputChunk { stream, data, .. } => match stream {
             Stream::Stdout => {
@@ -401,6 +537,25 @@ fn render(ev: &CellEvent) {
                 .unwrap_or_default();
             println!("[#{id}{short}] exit {exit_code} ({duration_ms}ms)");
         }
+    }
+}
+
+fn render_branches(branches: &[BranchSnapshot], current: &str) {
+    if branches.is_empty() {
+        println!("(no branches)");
+        return;
+    }
+    for b in branches {
+        let marker = if b.name == current { "*" } else { " " };
+        let state = if b.running {
+            "running".to_string()
+        } else {
+            b.tip_hash
+                .as_deref()
+                .map(|h| h[..h.len().min(7)].to_string())
+                .unwrap_or_else(|| "-".to_string())
+        };
+        println!("{marker} {:<24} #{:<4} {state}", b.name, b.tip);
     }
 }
 

@@ -21,7 +21,11 @@ enum Cmd {
     Daemon,
     /// Submit a command to the daemon and stream its output
     Run {
-        /// Parent cell (defaults to the last cell submitted by anyone)
+        /// Branch to run on (defaults to the current branch; see `fern switch`)
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// Parent cell. Defaults to the current branch's tip; pointing at a
+        /// historical cell forks a new branch.
         #[arg(short, long)]
         parent: Option<u64>,
         /// Who is submitting (defaults to $USER)
@@ -46,8 +50,30 @@ enum Cmd {
     Watch,
     /// Dump the cell tree
     Tree,
+    /// List branches, or manage them (new/rm/rename)
+    Branch {
+        #[command(subcommand)]
+        action: Option<BranchAction>,
+    },
+    /// Switch the current branch (where the next `fern run` lands)
+    Switch { name: String },
     /// Standalone REPL on the cell tree (no daemon, single-user)
     Repl,
+}
+
+#[derive(Subcommand)]
+enum BranchAction {
+    /// Create a new branch
+    New {
+        name: String,
+        /// Cell to base the branch on (defaults to the current branch's tip)
+        #[arg(short, long)]
+        at: Option<u64>,
+    },
+    /// Delete a branch
+    Rm { name: String },
+    /// Rename a branch, keeping its tip
+    Rename { from: String, to: String },
 }
 
 #[tokio::main]
@@ -55,13 +81,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon => daemon::run().await,
-        Cmd::Run { parent, who, detach, interactive, source } => {
+        Cmd::Run { branch, parent, who, detach, interactive, source } => {
             let line = source.join(" ");
             if line.trim().is_empty() {
                 anyhow::bail!("no command");
             }
             if interactive || detach {
-                let id = client::submit_detached(parent, who, line, interactive).await?;
+                let id = client::submit_detached(branch, parent, who, line, interactive).await?;
                 if interactive {
                     println!("interactive: cell #{id} running; attach with `fern attach {id}`");
                 } else {
@@ -69,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             } else {
-                let code = client::run(parent, who, line).await?;
+                let code = client::run(branch, parent, who, line).await?;
                 std::process::exit(code);
             }
         }
@@ -77,6 +103,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Attach { id } => client::attach(id).await,
         Cmd::Watch => client::watch().await,
         Cmd::Tree => client::tree().await,
+        Cmd::Branch { action } => match action {
+            None => client::branch_list().await,
+            Some(BranchAction::New { name, at }) => client::branch_new(name, at).await,
+            Some(BranchAction::Rm { name }) => client::branch_rm(name).await,
+            Some(BranchAction::Rename { from, to }) => client::branch_rename(from, to).await,
+        },
+        Cmd::Switch { name } => client::switch(name).await,
         Cmd::Repl => repl::run().await,
     }
 }
