@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -576,28 +577,32 @@ async fn handle_attach(
     rd_lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
-    let active = state.active.lock().await.get(&id).cloned();
-    let Some(ac) = active else {
+    // A PTY cell registers its handle a moment after Started (once eval spawns
+    // the process), so a fast attacher can arrive first. Retry briefly to avoid
+    // racing the registration before giving up.
+    let mut found: Option<Arc<ActiveCell>> = None;
+    for _ in 0..25 {
+        match state.active.lock().await.get(&id).cloned() {
+            Some(ac) if ac.pty.is_some() => {
+                found = Some(ac);
+                break;
+            }
+            Some(_) => {} // active but no PTY yet — wait and retry
+            None => break, // not running (finished or never existed)
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let Some(ac) = found else {
         send(
             wr,
             &Response::Error {
-                message: format!("cell #{id} is not running (or not interactive)"),
+                message: format!("cell #{id} is not running, or not a terminal cell"),
             },
         )
         .await?;
         return Ok(());
     };
-    let Some(pty) = &ac.pty else {
-        send(
-            wr,
-            &Response::Error {
-                message: format!("cell #{id} is not interactive"),
-            },
-        )
-        .await?;
-        return Ok(());
-    };
-    let pty_input = pty.input.clone();
+    let pty_input = ac.pty.as_ref().expect("pty present").input.clone();
 
     send(wr, &Response::Ok).await?;
 
@@ -695,11 +700,18 @@ fn snapshot_branches(t: &Tree) -> Vec<BranchSnapshot> {
             } else {
                 cell.and_then(|c| c.hash.clone())
             };
+            // A branch is in terminal mode when its tip's end-state environment
+            // carries FERN_IO=tty (what the next command would inherit).
+            let tty = cell
+                .and_then(|c| c.result.as_ref())
+                .map(|r| r.end_state.env.get("FERN_IO").map(String::as_str) == Some("tty"))
+                .unwrap_or(false);
             BranchSnapshot {
                 name: name.clone(),
                 tip,
                 tip_hash,
                 running,
+                tty,
             }
         })
         .collect()

@@ -2,7 +2,6 @@ mod client;
 mod daemon;
 mod eval;
 mod parse;
-mod repl;
 mod tree;
 mod wire;
 
@@ -41,9 +40,10 @@ enum Cmd {
     },
     /// Kill a running detached cell
     Kill { id: u64 },
-    /// Attach to a running PTY cell at a branch's tip (or a cell id):
-    /// bidirectional raw-mode terminal. Ctrl+] detaches without killing.
-    Attach { target: String },
+    /// Attach to a branch and work on it: a finished tip gives a cooked prompt
+    /// (each line extends the branch); a live terminal tip drops you into raw
+    /// mode. Defaults to the current branch. Ctrl+] / :quit to leave.
+    Attach { target: Option<String> },
     /// Send one line of input to a running PTY cell (branch tip or cell id)
     Send { target: String, data: Vec<String> },
     /// Tail every cell event from every client
@@ -57,7 +57,7 @@ enum Cmd {
     },
     /// Switch the current branch (where the next `fern run` lands)
     Switch { name: String },
-    /// Standalone REPL on the cell tree (no daemon, single-user)
+    /// Alias for `attach` on the current branch (cooked prompt cockpit).
     Repl,
 }
 
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Kill { id } => client::kill(id).await,
-        Cmd::Attach { target } => client::attach(target).await,
+        Cmd::Attach { target } => client::cockpit(target).await,
         Cmd::Send { target, data } => client::send(target, data.join(" ")).await,
         Cmd::Watch => client::watch().await,
         Cmd::Tree => client::tree().await,
@@ -107,6 +107,6 @@ async fn main() -> anyhow::Result<()> {
             Some(BranchAction::Rename { from, to }) => client::branch_rename(from, to).await,
         },
         Cmd::Switch { name } => client::switch(name).await,
-        Cmd::Repl => repl::run().await,
+        Cmd::Repl => client::cockpit(None).await,
     }
 }

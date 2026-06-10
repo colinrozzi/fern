@@ -146,6 +146,9 @@ pub struct BranchSnapshot {
     pub tip_hash: Option<String>,
     /// True when the tip cell hasn't finished yet.
     pub running: bool,
+    /// True when the branch is in terminal mode (the tip's inherited
+    /// environment carries `FERN_IO=tty`), so the next command runs under a PTY.
+    pub tty: bool,
 }
 
 pub fn socket_path() -> std::path::PathBuf {

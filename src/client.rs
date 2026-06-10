@@ -199,40 +199,42 @@ async fn resolve_target(target: &str) -> Result<CellId> {
         .map_err(|_| anyhow!("no branch '{target}' and not a cell id"))
 }
 
-/// Attach to a running PTY cell at a branch's tip (or a cell id). Puts the
-/// terminal in raw mode so keys flow to the cell's PTY; Ctrl+] detaches
-/// without killing.
-pub async fn attach(target: String) -> Result<()> {
+enum AttachOutcome {
+    /// The user pressed Ctrl+] — the cell keeps running; leave the cockpit.
+    Detached,
+    /// The cell finished (or we streamed it to completion).
+    Completed,
+}
+
+/// Connect to a running cell. If it's a PTY cell, run a raw bidirectional
+/// terminal (Ctrl+] detaches); otherwise stream its output until it completes.
+async fn follow(id: CellId) -> Result<AttachOutcome> {
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use tokio::io::AsyncReadExt;
 
-    let id = resolve_target(&target).await?;
-
     let mut stream = connect().await?;
     send_req(&mut stream, &Request::Attach { id }).await?;
-
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();
 
-    // Read the daemon's first response — Ok means attached, Error otherwise.
     let first = lines
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("daemon closed connection"))?;
-    let first_resp: Response = serde_json::from_str(&first)?;
-    match first_resp {
+    match serde_json::from_str::<Response>(&first)? {
         Response::Ok => {}
-        Response::Error { message } => return Err(anyhow!(message)),
+        // Not a PTY cell (a pipe cell / builtin / already gone): just show output.
+        Response::Error { .. } => {
+            drop(wr);
+            return stream_until_done(id).await;
+        }
         other => return Err(anyhow!("expected Ok, got {other:?}")),
     }
 
     enable_raw_mode().context("enable raw mode")?;
-    // Make sure we always restore cooked mode on exit.
     let _guard = RawModeGuard;
+    eprintln!("[fern] driving cell #{id}. Ctrl+] to detach (leaves the cockpit).\r");
 
-    eprintln!("[fern] attached to cell #{id}. Ctrl+] to detach.\r");
-
-    // Reader: stdin → daemon Input requests. Detach on Ctrl+] (0x1d).
     let detach_signal = Arc::new(tokio::sync::Notify::new());
     let detach_signal_recv = detach_signal.clone();
 
@@ -245,7 +247,6 @@ pub async fn attach(target: String) -> Result<()> {
                 Ok(n) => n,
                 Err(_) => break,
             };
-            // Detach on Ctrl+] (GS, 0x1d)
             if buf[..n].contains(&0x1d) {
                 detach_signal.notify_one();
                 break;
@@ -261,13 +262,11 @@ pub async fn attach(target: String) -> Result<()> {
         }
     });
 
-    // Writer: daemon events → stdout (raw bytes, no Started/Completed framing).
     let event_task = async {
         use std::io::Write;
         let mut stdout = std::io::stdout();
         while let Some(line) = lines.next_line().await? {
-            let resp: Response = serde_json::from_str(&line)?;
-            match resp {
+            match serde_json::from_str::<Response>(&line)? {
                 Response::Event(CellEvent::OutputChunk { data, .. }) => {
                     stdout.write_all(data.as_bytes()).ok();
                     stdout.flush().ok();
@@ -286,15 +285,204 @@ pub async fn attach(target: String) -> Result<()> {
         Ok(())
     };
 
-    tokio::select! {
-        _ = event_task => {},
+    let outcome = tokio::select! {
+        _ = event_task => AttachOutcome::Completed,
         _ = detach_signal_recv.notified() => {
             eprintln!("\r\n[fern] detached (cell still running)\r");
+            AttachOutcome::Detached
         }
-    }
+    };
     stdin_task.abort();
     disable_raw_mode().ok();
+    Ok(outcome)
+}
+
+/// Stream a (non-PTY) running cell's output until it completes. Used when the
+/// tip isn't an attachable terminal — e.g. a running pipe cell started elsewhere.
+async fn stream_until_done(id: CellId) -> Result<AttachOutcome> {
+    use std::io::Write;
+    let mut stream = connect().await?;
+    send_req(&mut stream, &Request::Subscribe).await?;
+    let (rd, _wr) = stream.split();
+    let mut lines = BufReader::new(rd).lines();
+    while let Some(line) = lines.next_line().await? {
+        match serde_json::from_str::<Response>(&line)? {
+            Response::Event(CellEvent::OutputChunk { id: i, stream: s, data }) if i == id => {
+                match s {
+                    Stream::Stdout => {
+                        print!("{data}");
+                        std::io::stdout().flush().ok();
+                    }
+                    Stream::Stderr => {
+                        eprint!("{data}");
+                        std::io::stderr().flush().ok();
+                    }
+                }
+            }
+            Response::Event(CellEvent::Completed { id: i, exit_code, duration_ms, .. })
+                if i == id =>
+            {
+                println!("[#{i} exit {exit_code} {duration_ms}ms]");
+                return Ok(AttachOutcome::Completed);
+            }
+            _ => {}
+        }
+    }
+    Ok(AttachOutcome::Completed)
+}
+
+fn first_word(s: &str) -> &str {
+    s.split_whitespace().next().unwrap_or("")
+}
+
+async fn branch_tip_state(name: &str) -> Result<Option<(CellId, bool)>> {
+    let branches = fetch_branches().await?;
+    Ok(branches
+        .iter()
+        .find(|b| b.name == name)
+        .map(|b| (b.tip, b.running)))
+}
+
+async fn branch_is_tty(name: &str) -> Result<bool> {
+    let branches = fetch_branches().await?;
+    Ok(branches
+        .iter()
+        .find(|b| b.name == name)
+        .map(|b| b.tty)
+        .unwrap_or(false))
+}
+
+/// The unified cockpit: attach to a branch and work on it. A finished tip gives
+/// a cooked prompt (each line extends the branch); a live PTY tip drops you into
+/// the raw terminal. On a `FERN_IO=tty` branch, commands you type are launched
+/// detached and you drive them raw; on a pipe branch they run inline + stream.
+pub async fn cockpit(target: Option<String>) -> Result<()> {
+    use std::io::Write;
+
+    let mut branch = target.unwrap_or_else(read_current_branch);
+    {
+        let branches = fetch_branches().await?;
+        if !branches.iter().any(|b| b.name == branch) {
+            return Err(anyhow!(
+                "no such branch '{branch}' (create it with `fern branch new {branch}`)"
+            ));
+        }
+    }
+    write_current_branch(&branch);
+    println!("fern — attached to '{branch}'. :help for commands, :quit to leave.");
+
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+
+    loop {
+        // If the tip is running, follow it (raw if it's a terminal) first.
+        if let Some((tip, true)) = branch_tip_state(&branch).await? {
+            match follow(tip).await? {
+                AttachOutcome::Detached => return Ok(()),
+                AttachOutcome::Completed => {}
+            }
+            continue;
+        }
+
+        print!("(on {branch}) > ");
+        std::io::stdout().flush().ok();
+        let Some(line) = lines.next_line().await? else { break };
+        let t = line.trim().to_string();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(':') {
+            match cockpit_meta(&mut branch, rest).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => println!("error: {e}"),
+            }
+            continue;
+        }
+
+        let who = std::env::var("USER").ok();
+        // A tty branch hands the raw terminal to each (non-builtin) program;
+        // a pipe branch runs commands inline and streams their output.
+        if branch_is_tty(&branch).await? && !matches!(first_word(&t), "cd" | "export" | "unset") {
+            match submit_detached(Some(branch.clone()), None, who, t).await {
+                Ok(id) => match follow(id).await {
+                    Ok(AttachOutcome::Detached) => return Ok(()),
+                    Ok(AttachOutcome::Completed) => {}
+                    Err(e) => println!("error: {e}"),
+                },
+                Err(e) => println!("error: {e}"),
+            }
+        } else {
+            match submit_streaming(Some(branch.clone()), None, who, t, |s, data| match s {
+                Stream::Stdout => {
+                    print!("{data}");
+                    std::io::stdout().flush().ok();
+                }
+                Stream::Stderr => {
+                    eprint!("{data}");
+                    std::io::stderr().flush().ok();
+                }
+            })
+            .await
+            {
+                Ok(snap) => {
+                    let last = snap
+                        .stderr
+                        .chars()
+                        .last()
+                        .or_else(|| snap.stdout.chars().last());
+                    if matches!(last, Some(c) if c != '\n') {
+                        println!();
+                    }
+                    let status = match snap.exit_code {
+                        Some(code) => format!("exit {code}"),
+                        None => "running".into(),
+                    };
+                    println!("[#{} {status} {}ms]", snap.id, snap.duration_ms);
+                }
+                Err(e) => println!("error: {e}"),
+            }
+        }
+    }
     Ok(())
+}
+
+/// Handle a `:meta` command in the cockpit. Returns Ok(false) to quit.
+async fn cockpit_meta(branch: &mut String, line: &str) -> Result<bool> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    match parts.first().copied().unwrap_or("") {
+        "quit" | "q" | "exit" => return Ok(false),
+        "help" | "h" | "" => {
+            println!(":branches          list branches");
+            println!(":switch <name>     switch the current branch");
+            println!(":tree              show the cell tree");
+            println!(":at                show the current branch");
+            println!(":quit / :q         leave the cockpit");
+        }
+        "at" => println!("on branch '{branch}'"),
+        "branches" => {
+            let branches = fetch_branches().await?;
+            render_branches(&branches, branch);
+        }
+        "tree" => {
+            let snap = fetch_tree().await?;
+            render_tree(&snap);
+        }
+        "switch" => {
+            let name = parts
+                .get(1)
+                .ok_or_else(|| anyhow!(":switch needs a branch name"))?;
+            let branches = fetch_branches().await?;
+            if !branches.iter().any(|b| b.name == *name) {
+                return Err(anyhow!("no such branch '{name}'"));
+            }
+            *branch = name.to_string();
+            write_current_branch(name);
+            println!("switched to '{name}'");
+        }
+        other => return Err(anyhow!("unknown command :{other} (try :help)")),
+    }
+    Ok(true)
 }
 
 struct RawModeGuard;
