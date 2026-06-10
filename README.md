@@ -98,19 +98,25 @@ fern kill 7                           # terminate a running cell
 
 `attach` and `send` take a **branch name or a cell id** — a branch resolves to its current tip.
 
-## The REPL
+## The cockpit
 
-A standalone interactive prompt over the daemon — each line you type is a new cell on your current branch:
+`fern attach [branch]` is one unified cockpit whose behavior follows the branch tip:
+
+- a **finished tip** gives a cooked prompt — each line you type extends the branch (with `:branches` / `:switch` / `:tree` / `:at` / `:quit`);
+- a **live terminal tip** drops you straight into the raw PTY.
+
+On a pipe branch your commands run inline and stream; on a `FERN_IO=tty` branch each command is launched detached and you drive it raw, returning to the prompt when it exits. `Ctrl+]` leaves the cockpit (the cell keeps running); `:quit` does too.
 
 ```bash
-fern repl
-fern repl — type :help for commands, :quit to exit
+fern attach            # cockpit on the current branch
+fern attach experiment # …or a named one
 (on main) > echo hello
 hello
 [#1 exit 0 2ms]
-(on main) > :branches
 (on main) > :switch experiment
 ```
+
+`fern repl` is an alias for `fern attach` on the current branch.
 
 ## The model
 
@@ -136,8 +142,7 @@ Flat modules in `src/`:
 | `eval.rs` | Async streaming evaluator (`tokio::process`, builtins, pipelines, redirects, `FERN_IO=tty` PTY spawn) |
 | `wire.rs` | Protocol types (`Request`, `Response`, `CellEvent`, `CellSnapshot`, `BranchSnapshot`) |
 | `daemon.rs` | Unix-socket server, the cell tree + branches, broadcast, inline/detached execution, PTY attach |
-| `client.rs` | Daemon RPCs + the `run`/`watch`/`tree`/`branch`/`switch`/`attach`/`send`/`kill` CLI verbs |
-| `repl.rs` | Interactive REPL on top of the client API (no in-process tree) |
+| `client.rs` | Daemon RPCs + CLI verbs (`run`/`watch`/`tree`/`branch`/`switch`/`attach`/`send`/`kill`) + the cockpit |
 | `main.rs` | `clap` CLI |
 
 ## Limitations
@@ -149,7 +154,6 @@ This is a prototype. Known gaps:
 - `FERN_IO=tty` applies to single external commands; pipelines and redirected commands stay pipe-mode. PTY output is a single (merged) terminal stream — no stdout/stderr split for terminal cells.
 - Only **detached** tty cells are attachable; an inline `fern run` on a tty branch captures output but has no stdin.
 - Multiple clients attaching to the same cell will interleave their inputs.
-- `fern attach` / `fern repl` aren't yet a single unified "cockpit" (cooked prompt at a finished tip, raw terminal at a live one).
 
 ## License
 
