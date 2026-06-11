@@ -41,7 +41,6 @@ pub async fn eval_line(
 /// these up to the daemon (when a registrar is provided) so `attach`/`kill` can
 /// reach a still-running terminal cell: write to `input`, terminate via `killer`.
 pub struct PtyRegistration {
-    pub cell_id: CellId,
     pub input: mpsc::UnboundedSender<Vec<u8>>,
     pub killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
@@ -94,7 +93,21 @@ async fn eval_command(
         return Ok((state.clone(), 0));
     }
 
-    match argv[0].as_str() {
+    let name = argv[0].as_str();
+    if !BUILTINS.contains(&name) {
+        // External command. I/O mode is inherited environment: a cell whose
+        // state carries FERN_IO=tty runs external commands under a PTY (so
+        // isatty-aware programs see a terminal). Redirects fall back to pipes.
+        if tty_mode(state) && c.redirects.is_empty() {
+            let exit = exec_under_pty(&argv, state, cell_id, events, pty_reg).await?;
+            return Ok((state.clone(), exit));
+        }
+        let proc = Process::from_state(state, argv);
+        let exit = exec_with_redirects(&proc, &c.redirects, state, cell_id, events).await?;
+        return Ok((state.clone(), exit));
+    }
+
+    match name {
         "cd" => {
             if !c.redirects.is_empty() {
                 return Err(anyhow!("redirects on builtin not yet supported"));
@@ -136,24 +149,52 @@ async fn eval_command(
             }
             Ok((ns, 0))
         }
-        _ => {
-            // I/O mode is inherited environment: a cell whose state carries
-            // FERN_IO=tty runs external commands under a PTY (so isatty-aware
-            // programs see a terminal). Redirects fall back to the pipe path.
-            if tty_mode(state) && c.redirects.is_empty() {
-                let exit = exec_under_pty(&argv, state, cell_id, events, pty_reg).await?;
-                return Ok((state.clone(), exit));
-            }
-            let proc = Process::from_state(state, argv);
-            let exit = exec_with_redirects(&proc, &c.redirects, state, cell_id, events).await?;
-            Ok((state.clone(), exit))
+        _ => unreachable!("non-builtin `{name}` reached builtin dispatch"),
+    }
+}
+
+/// The shell builtins handled in-process by the evaluator. This is the single
+/// source of truth: `eval_command` dispatches external-vs-builtin off this list,
+/// and the client consults it (via [`is_pure_builtin_line`]) to decide whether a
+/// line needs a terminal. Add a builtin here *and* in the match above.
+pub const BUILTINS: &[&str] = &["cd", "export", "unset"];
+
+/// True iff `source` parses and every command in it is a builtin — i.e. running
+/// it spawns no external program, so on a `FERN_IO=tty` branch it needs no
+/// terminal and can run inline. Conservative: a parse failure, a pipeline, or a
+/// leading word that isn't a literal builtin all yield `false`.
+pub fn is_pure_builtin_line(source: &str) -> bool {
+    matches!(parse::parse(source), Ok(Some(stmt)) if stmt_is_pure_builtin(&stmt))
+}
+
+fn stmt_is_pure_builtin(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Cmd(c) => command_is_builtin(c),
+        // A pipeline always runs its stages as external processes.
+        Stmt::Pipe(_) => false,
+        Stmt::AndIf(l, r) | Stmt::OrIf(l, r) | Stmt::Seq(l, r) => {
+            stmt_is_pure_builtin(l) && stmt_is_pure_builtin(r)
         }
+    }
+}
+
+fn command_is_builtin(c: &Command) -> bool {
+    match c.words.first() {
+        // An empty command (e.g. a bare assignment we don't model) is a no-op.
+        None => true,
+        // Only a single-literal leading word can be statically classified; a
+        // word built from a variable could expand to anything, so treat it as
+        // external (the safe choice — it gets the terminal if the branch is tty).
+        Some(w) => matches!(
+            w.segments.as_slice(),
+            [Segment::Literal(name)] if BUILTINS.contains(&name.as_str())
+        ),
     }
 }
 
 /// True when the inherited environment asks for a terminal (`FERN_IO=tty`).
 /// Mode is configuration carried by the branch, not a per-cell flag.
-fn tty_mode(state: &State) -> bool {
+pub fn tty_mode(state: &State) -> bool {
     state.env.get("FERN_IO").map(|v| v == "tty").unwrap_or(false)
 }
 
@@ -405,7 +446,6 @@ async fn exec_under_pty(
             }
         });
         let _ = reg.send(PtyRegistration {
-            cell_id,
             input: input_tx,
             killer: child.clone_killer(),
         });
@@ -548,6 +588,27 @@ mod tests {
         let (_s, o) = eval_line_collect(&st(), "echo hello").await.unwrap();
         assert_eq!(out_str(&o).trim(), "hello");
         assert_eq!(o.exit_code, 0);
+    }
+
+    #[test]
+    fn pure_builtin_classification() {
+        // Pure builtins — no external program, so no terminal needed.
+        assert!(is_pure_builtin_line("cd /tmp"));
+        assert!(is_pure_builtin_line("export FOO=bar"));
+        assert!(is_pure_builtin_line("unset FOO"));
+        // Builtins chained still spawn nothing external.
+        assert!(is_pure_builtin_line("cd /tmp && export FERN_IO=tty"));
+        assert!(is_pure_builtin_line("cd /a; cd /b; unset X"));
+
+        // Anything that runs an external program is not pure-builtin.
+        assert!(!is_pure_builtin_line("ls"));
+        assert!(!is_pure_builtin_line("vim"));
+        assert!(!is_pure_builtin_line("cd /tmp && ls")); // one external stage is enough
+        assert!(!is_pure_builtin_line("echo hi | cat")); // pipelines run external
+        // A var-led command can expand to anything → treated as external (safe).
+        assert!(!is_pure_builtin_line("$EDITOR"));
+        // Empty / unparseable lines aren't builtins.
+        assert!(!is_pure_builtin_line(""));
     }
 
     #[tokio::test]

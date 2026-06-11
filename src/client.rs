@@ -331,10 +331,6 @@ async fn stream_until_done(id: CellId) -> Result<AttachOutcome> {
     Ok(AttachOutcome::Completed)
 }
 
-fn first_word(s: &str) -> &str {
-    s.split_whitespace().next().unwrap_or("")
-}
-
 async fn branch_tip_state(name: &str) -> Result<Option<(CellId, bool)>> {
     let branches = fetch_branches().await?;
     Ok(branches
@@ -401,9 +397,10 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
         }
 
         let who = std::env::var("USER").ok();
-        // A tty branch hands the raw terminal to each (non-builtin) program;
-        // a pipe branch runs commands inline and streams their output.
-        if branch_is_tty(&branch).await? && !matches!(first_word(&t), "cd" | "export" | "unset") {
+        // A tty branch hands the raw terminal to each program that spawns one;
+        // lines that are purely builtins (cd/export/…) spawn nothing, so run
+        // them inline and stream. The builtin set is owned by the evaluator.
+        if branch_is_tty(&branch).await? && !crate::eval::is_pure_builtin_line(&t) {
             match submit_detached(Some(branch.clone()), None, who, t).await {
                 Ok(id) => match follow(id).await {
                     Ok(AttachOutcome::Detached) => return Ok(()),

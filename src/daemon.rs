@@ -26,9 +26,20 @@ struct ActiveCell {
     /// Aborts the eval task. Used to kill pipe-mode cells; PTY cells are killed
     /// via their `killer` instead (aborting the task wouldn't reap the child).
     abort: AbortHandle,
-    /// Present once a cell has spawned a PTY (a `FERN_IO=tty` external command
-    /// on a detached cell). Carries the stdin channel + child killer.
-    pty: Option<PtyHandle>,
+    /// Whether this cell runs in tty mode (inherited `FERN_IO=tty`). Only tty
+    /// cells ever spawn a PTY, so only they are attachable — for anything else
+    /// `attach` fails fast and the client falls back to plain streaming.
+    tty: bool,
+    /// The running PTY's controls, populated once the cell spawns a terminal
+    /// (a `FERN_IO=tty` external command). `ready` fires when this is set.
+    pty: tokio::sync::Mutex<Option<PtyHandle>>,
+    /// Notified when `pty` is populated, or when `finished` flips — so an
+    /// attacher waits deterministically instead of polling.
+    ready: tokio::sync::Notify,
+    /// Set just before the cell is finalized, so a waiter wakes and gives up
+    /// rather than waiting for a PTY that will never come (e.g. a tty branch
+    /// running a pipeline, or a spawn that failed).
+    finished: std::sync::atomic::AtomicBool,
 }
 
 struct PtyHandle {
@@ -307,6 +318,13 @@ async fn handle_submit(
         (id, parent_cell, parent_state, landed)
     };
 
+    // For detached cells, set up and register the ActiveCell *before* announcing
+    // Started, so any client that races in on the event is guaranteed to find
+    // the active entry (and can wait on it for the PTY to register).
+    if detach {
+        start_detached(state.clone(), cell_id, parent_state.clone(), source.clone()).await;
+    }
+
     let started_event = CellEvent::Started {
         id: cell_id,
         parent: Some(parent_cell),
@@ -318,10 +336,6 @@ async fn handle_submit(
     send(wr, &Response::Event(started_event)).await?;
 
     if detach {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            run_detached(state_clone, cell_id, parent_state, source).await;
-        });
         return Ok(());
     }
 
@@ -428,7 +442,11 @@ async fn run_inline(
     Ok(())
 }
 
-async fn run_detached(
+/// Launch a detached cell: spawn eval, register the `ActiveCell` (so `attach`
+/// can find and wait on it), and run output-draining + finalization in the
+/// background. Returns once the `ActiveCell` is registered — the caller can
+/// then safely announce `Started`.
+async fn start_detached(
     state: Arc<DaemonState>,
     cell_id: CellId,
     parent_state: State,
@@ -444,94 +462,92 @@ async fn run_detached(
         crate::eval::eval_line(&eval_state, &src, cell_id, chunk_tx, Some(reg_tx)).await
     });
 
-    state.active.lock().await.insert(
-        cell_id,
-        Arc::new(ActiveCell {
-            abort: eval_handle.abort_handle(),
-            pty: None,
-        }),
-    );
+    let ac = Arc::new(ActiveCell {
+        abort: eval_handle.abort_handle(),
+        tty: crate::eval::tty_mode(&parent_state),
+        pty: tokio::sync::Mutex::new(None),
+        ready: tokio::sync::Notify::new(),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    });
+    state.active.lock().await.insert(cell_id, ac.clone());
 
-    // If the cell spawns a PTY (FERN_IO=tty), fold its input + killer into the
-    // active entry so attach/send/kill can reach it. The channel closes when
-    // eval finishes, ending this task.
-    let reg_state = state.clone();
+    // Fold the PTY controls into the active entry once eval spawns a terminal,
+    // waking any attacher waiting on it. The channel closes when eval finishes.
+    let reg_ac = ac.clone();
     tokio::spawn(async move {
         while let Some(reg) = reg_rx.recv().await {
-            let mut active = reg_state.active.lock().await;
-            if let Some(existing) = active.get(&reg.cell_id) {
-                let abort = existing.abort.clone();
-                active.insert(
-                    reg.cell_id,
-                    Arc::new(ActiveCell {
-                        abort,
-                        pty: Some(PtyHandle {
-                            input: reg.input,
-                            killer: std::sync::Mutex::new(reg.killer),
-                        }),
-                    }),
-                );
-            }
+            *reg_ac.pty.lock().await = Some(PtyHandle {
+                input: reg.input,
+                killer: std::sync::Mutex::new(reg.killer),
+            });
+            reg_ac.ready.notify_waiters();
         }
     });
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    while let Some(ev) = chunk_rx.recv().await {
-        if let CellEvent::OutputChunk { stream, data, .. } = &ev {
-            match stream {
-                Stream::Stdout => stdout.push_str(data),
-                Stream::Stderr => stderr.push_str(data),
+    // Background: drain output → finalize the cell → broadcast Completed.
+    tokio::spawn(async move {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        while let Some(ev) = chunk_rx.recv().await {
+            if let CellEvent::OutputChunk { stream, data, .. } = &ev {
+                match stream {
+                    Stream::Stdout => stdout.push_str(data),
+                    Stream::Stderr => stderr.push_str(data),
+                }
             }
+            let _ = state.events.send(ev);
         }
-        let _ = state.events.send(ev);
-    }
 
-    let join = eval_handle.await;
-    let (new_state, exit_code) = match join {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            let msg = format!("{e}\n");
-            let _ = state.events.send(CellEvent::OutputChunk {
-                id: cell_id,
-                stream: Stream::Stderr,
-                data: msg.clone(),
-            });
-            stderr.push_str(&msg);
-            (parent_state.clone(), 2)
-        }
-        Err(je) if je.is_cancelled() => {
-            stderr.push_str("[killed by fern kill]\n");
-            (parent_state.clone(), -1)
-        }
-        Err(e) => {
-            eprintln!("detached cell #{cell_id} panicked: {e}");
-            (parent_state.clone(), 2)
-        }
-    };
-    let duration = started.elapsed();
+        let (new_state, exit_code) = match eval_handle.await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                let msg = format!("{e}\n");
+                let _ = state.events.send(CellEvent::OutputChunk {
+                    id: cell_id,
+                    stream: Stream::Stderr,
+                    data: msg.clone(),
+                });
+                stderr.push_str(&msg);
+                (parent_state.clone(), 2)
+            }
+            Err(je) if je.is_cancelled() => {
+                stderr.push_str("[killed by fern kill]\n");
+                (parent_state.clone(), -1)
+            }
+            Err(e) => {
+                eprintln!("detached cell #{cell_id} panicked: {e}");
+                (parent_state.clone(), 2)
+            }
+        };
+        let duration = started.elapsed();
 
-    let hash = {
-        let mut t = state.tree.lock().await;
-        t.set_cell_result(
-            cell_id,
-            CellResult {
-                exit_code,
-                stdout: stdout.into_bytes(),
-                stderr: stderr.into_bytes(),
-                duration,
-                end_state: new_state,
-            },
-        );
-        t.get(cell_id).and_then(|c| c.hash.clone())
-    };
-    state.active.lock().await.remove(&cell_id);
+        let hash = {
+            let mut t = state.tree.lock().await;
+            t.set_cell_result(
+                cell_id,
+                CellResult {
+                    exit_code,
+                    stdout: stdout.into_bytes(),
+                    stderr: stderr.into_bytes(),
+                    duration,
+                    end_state: new_state,
+                },
+            );
+            t.get(cell_id).and_then(|c| c.hash.clone())
+        };
 
-    let _ = state.events.send(CellEvent::Completed {
-        id: cell_id,
-        exit_code,
-        duration_ms: duration.as_millis() as u64,
-        hash,
+        // Wake any attacher still waiting for a PTY that will never arrive,
+        // then drop the active entry.
+        ac.finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        ac.ready.notify_waiters();
+        state.active.lock().await.remove(&cell_id);
+
+        let _ = state.events.send(CellEvent::Completed {
+            id: cell_id,
+            exit_code,
+            duration_ms: duration.as_millis() as u64,
+            hash,
+        });
     });
 }
 
@@ -545,7 +561,8 @@ async fn handle_kill(
     let active = state.active.lock().await.get(&id).cloned();
     match active {
         Some(ac) => {
-            if let Some(pty) = &ac.pty {
+            let pty = ac.pty.lock().await;
+            if let Some(pty) = pty.as_ref() {
                 // PTY cell: kill the child; eval reaps it and records the result.
                 if let Ok(mut killer) = pty.killer.lock() {
                     let _ = killer.kill();
@@ -577,32 +594,65 @@ async fn handle_attach(
     rd_lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
-    // A PTY cell registers its handle a moment after Started (once eval spawns
-    // the process), so a fast attacher can arrive first. Retry briefly to avoid
-    // racing the registration before giving up.
-    let mut found: Option<Arc<ActiveCell>> = None;
-    for _ in 0..25 {
-        match state.active.lock().await.get(&id).cloned() {
-            Some(ac) if ac.pty.is_some() => {
-                found = Some(ac);
-                break;
-            }
-            Some(_) => {} // active but no PTY yet — wait and retry
-            None => break, // not running (finished or never existed)
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let Some(ac) = found else {
+    use std::sync::atomic::Ordering;
+
+    let Some(ac) = state.active.lock().await.get(&id).cloned() else {
         send(
             wr,
             &Response::Error {
-                message: format!("cell #{id} is not running, or not a terminal cell"),
+                message: format!("cell #{id} is not running"),
             },
         )
         .await?;
         return Ok(());
     };
-    let pty_input = ac.pty.as_ref().expect("pty present").input.clone();
+    // Only tty cells ever spawn a PTY; fail fast on anything else so the client
+    // falls back to plain streaming instead of waiting.
+    if !ac.tty {
+        send(
+            wr,
+            &Response::Error {
+                message: format!("cell #{id} is not a terminal cell"),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // A tty cell registers its PTY a moment after Started (once eval spawns the
+    // process), so we may briefly arrive first. Wait on `ready` rather than
+    // polling: `enable()` arms the notification before we check the slot, so a
+    // registration can't slip through the gap; `finished` covers a tty cell that
+    // exits without ever spawning a PTY (a pipeline, or a failed spawn).
+    let pty_input = {
+        let notified = ac.ready.notified();
+        tokio::pin!(notified);
+        loop {
+            notified.as_mut().enable();
+            if let Some(pty) = ac.pty.lock().await.as_ref() {
+                break Some(pty.input.clone());
+            }
+            if ac.finished.load(Ordering::SeqCst) {
+                break None;
+            }
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                // Safety net against a missed wakeup; registration is normally ms.
+                _ = tokio::time::sleep(Duration::from_secs(5)) => break None,
+            }
+            notified.set(ac.ready.notified());
+        }
+    };
+    let Some(pty_input) = pty_input else {
+        send(
+            wr,
+            &Response::Error {
+                message: format!("cell #{id} spawned no attachable terminal process"),
+            },
+        )
+        .await?;
+        return Ok(());
+    };
 
     send(wr, &Response::Ok).await?;
 
