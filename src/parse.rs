@@ -2,15 +2,16 @@
 //!
 //! Phase 1 supports:
 //!   * single + double quoted strings (`'...'`, `"..."`)
-//!   * variable substitution: `$NAME`, `${NAME}` (in barewords and inside `"..."`)
+//!   * variable substitution: `$NAME`, `${NAME}`, `$?` (in barewords and inside `"..."`)
+//!   * command substitution: `$(...)` (subshell semantics, expands to one word)
 //!   * pipelines: `a | b | c`
 //!   * redirections: `> file`, `>> file`, `< file`, `2> file` (and other fd-prefixed forms)
 //!   * sequencing: `&&`, `||`, `;`
 //!   * comments: `# ...` to end of line
 //!   * backslash escapes (outside single quotes)
 //!
-//! Out of scope for now: command substitution `$(...)`, glob, background `&`,
-//! control flow, functions, heredocs, arrays, arithmetic.
+//! Out of scope for now: glob, background `&`, control flow, functions,
+//! heredocs, arrays, arithmetic.
 
 use anyhow::{Result, anyhow};
 
@@ -40,6 +41,10 @@ pub struct Word {
 pub enum Segment {
     Literal(String),
     Var(String),
+    /// `$(...)` — parsed eagerly so syntax errors surface at parse time.
+    /// Evaluated in a subshell-like clone of state; expands to one word
+    /// (fern doesn't word-split `$VAR` either).
+    CmdSub(Box<Stmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,8 +199,7 @@ impl<'a> Lexer<'a> {
                         }
                         if d == b'$' {
                             flush(&mut lit, &mut segments);
-                            let name = self.read_var_ref()?;
-                            segments.push(Segment::Var(name));
+                            segments.push(self.read_dollar()?);
                         } else if d == b'\\' {
                             self.pos += 1;
                             if let Some(esc) = self.peek() {
@@ -219,8 +223,7 @@ impl<'a> Lexer<'a> {
                 }
                 b'$' => {
                     flush(&mut lit, &mut segments);
-                    let name = self.read_var_ref()?;
-                    segments.push(Segment::Var(name));
+                    segments.push(self.read_dollar()?);
                 }
                 b'\\' => {
                     self.pos += 1;
@@ -240,6 +243,52 @@ impl<'a> Lexer<'a> {
             segments.push(Segment::Literal(lit));
         }
         Ok(Word { segments })
+    }
+
+    /// Read a `$…` form: `$(cmd)` becomes a CmdSub segment (recursively
+    /// parsed), anything else a Var via `read_var_ref`.
+    fn read_dollar(&mut self) -> Result<Segment> {
+        debug_assert_eq!(self.peek(), Some(b'$'));
+        if self.src.get(self.pos + 1) == Some(&b'(') {
+            self.pos += 2;
+            let inner = self.read_until_close_paren()?;
+            return match parse(&inner)? {
+                Some(stmt) => Ok(Segment::CmdSub(Box::new(stmt))),
+                None => Ok(Segment::Literal(String::new())), // $() / $(#…) → empty
+            };
+        }
+        Ok(Segment::Var(self.read_var_ref()?))
+    }
+
+    /// Consume up to (and including) the `)` matching an already-consumed
+    /// `$(`, returning the inner source. Tracks nesting and skips quoted
+    /// spans so `$(echo "a)b")` and nested `$(… $(…) …)` scan correctly.
+    fn read_until_close_paren(&mut self) -> Result<String> {
+        let start = self.pos;
+        let mut depth = 1usize;
+        let (mut in_single, mut in_double) = (false, false);
+        while let Some(c) = self.peek() {
+            match c {
+                b'\'' if !in_double => in_single = !in_single,
+                b'"' if !in_single => in_double = !in_double,
+                b'\\' if !in_single => {
+                    // Escape: skip the next byte too (handled below by extra bump).
+                    self.pos += 1;
+                }
+                b'(' if !in_single && !in_double => depth += 1,
+                b')' if !in_single && !in_double => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let inner = std::str::from_utf8(&self.src[start..self.pos])?.to_string();
+                        self.pos += 1; // consume the `)`
+                        return Ok(inner);
+                    }
+                }
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        Err(anyhow!("unterminated $(…)"))
     }
 
     fn read_var_ref(&mut self) -> Result<String> {
