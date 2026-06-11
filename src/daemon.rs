@@ -133,7 +133,9 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
             }
             Request::CreateBranch { name, at } => {
                 let mut t = state.tree.lock().await;
-                if t.branch_exists(&name) {
+                if let Err(message) = validate_branch_name(&name) {
+                    send(&mut wr, &Response::Error { message }).await?;
+                } else if t.branch_exists(&name) {
                     send(
                         &mut wr,
                         &Response::Error {
@@ -180,7 +182,9 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
             }
             Request::RenameBranch { from, to } => {
                 let mut t = state.tree.lock().await;
-                if !t.branch_exists(&from) {
+                if let Err(message) = validate_branch_name(&to) {
+                    send(&mut wr, &Response::Error { message }).await?;
+                } else if !t.branch_exists(&from) {
                     send(
                         &mut wr,
                         &Response::Error {
@@ -345,14 +349,38 @@ async fn handle_submit(
     run_inline(state, cell_id, parent_state, source, wr).await
 }
 
+/// Prefix reserved for auto-generated fork branches. Users can't create names
+/// under it, so a `fork-*` branch is unambiguously machine-made.
+const FORK_PREFIX: &str = "fork-";
+
 /// Pick a unique `fork-<uuid>` branch name not already in use.
 fn gen_fork_name(t: &Tree) -> String {
     loop {
-        let name = format!("fork-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let name = format!("{FORK_PREFIX}{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         if !t.branch_exists(&name) {
             return name;
         }
     }
+}
+
+/// Validate a user-supplied branch name. Names must be non-empty, free of
+/// whitespace/control characters (they're CLI args and a cursor file), and
+/// outside the reserved `fork-` namespace. Returns the reason on rejection.
+fn validate_branch_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("branch name can't be empty".into());
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "branch name '{name}' can't contain whitespace or control characters"
+        ));
+    }
+    if name.starts_with(FORK_PREFIX) {
+        return Err(format!(
+            "'{FORK_PREFIX}*' is reserved for auto-generated fork branches"
+        ));
+    }
+    Ok(())
 }
 
 async fn run_inline(
@@ -780,4 +808,24 @@ fn snapshot_tree(t: &Tree) -> TreeSnapshot {
     }
     cells.sort_by_key(|c| c.id);
     TreeSnapshot { cells }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_name_validation() {
+        assert!(validate_branch_name("feature").is_ok());
+        assert!(validate_branch_name("feat/x-2").is_ok());
+
+        assert!(validate_branch_name("").is_err()); // empty
+        assert!(validate_branch_name("has space").is_err()); // whitespace
+        assert!(validate_branch_name("tab\tname").is_err()); // control
+        assert!(validate_branch_name("fork-abcd1234").is_err()); // reserved namespace
+
+        // The auto-generated names the daemon itself mints are exactly the ones
+        // users are barred from, so they never collide with a user branch.
+        assert!(gen_fork_name(&Tree::new(State::baseline().unwrap(), SystemInfo::collect())).starts_with(FORK_PREFIX));
+    }
 }
