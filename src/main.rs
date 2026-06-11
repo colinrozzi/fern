@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Kill { id } => client::kill(id).await,
-        Cmd::Attach { target } => client::cockpit(target).await,
+        Cmd::Attach { target } => exit_after(client::cockpit(target).await),
         Cmd::Send { target, data } => client::send(target, data.join(" ")).await,
         Cmd::Watch => client::watch().await,
         Cmd::Tree => client::tree().await,
@@ -121,6 +121,20 @@ async fn main() -> anyhow::Result<()> {
             Some(BranchAction::Rename { from, to }) => client::branch_rename(from, to).await,
         },
         Cmd::Switch { name } => client::switch(name).await,
-        Cmd::Repl => client::cockpit(None).await,
+        Cmd::Repl => exit_after(client::cockpit(None).await),
+    }
+}
+
+/// The cockpit's shared stdin pump may be parked in a blocking read that
+/// tokio's runtime shutdown would wait on forever (an idle terminal never
+/// yields the read). Exit explicitly instead — atexit handlers (including
+/// coverage profile flushing) still run.
+fn exit_after(res: anyhow::Result<()>) -> ! {
+    match res {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
     }
 }

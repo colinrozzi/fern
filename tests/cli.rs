@@ -470,3 +470,251 @@ fn protocol_error_paths() {
     let resp = raw_request(&d.dir, r#"{"kind":"attach","id":42}"#);
     assert!(resp.contains("not running"), "got: {resp}");
 }
+
+// ---------- Cockpit live feed (other clients render at the prompt) ---------
+
+#[test]
+fn cockpit_renders_other_clients_cells_live() {
+    let d = TestDaemon::start();
+    let mut child = d
+        .fern()
+        .arg("attach")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // Park at the prompt, then land a cell from a second client.
+    std::thread::sleep(Duration::from_millis(300));
+    d.ok(&["run", "--who", "other", "echo feed-ping"]);
+    std::thread::sleep(Duration::from_millis(300));
+    stdin.write_all(b":quit\n").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("other on main") && stdout.contains("feed-ping"),
+        "cockpit feed: {stdout}"
+    );
+}
+
+#[test]
+fn cockpit_streams_a_running_pipe_tip_to_completion() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "--detach", "sleep 0.4; echo done-late"]);
+    // Tip is running and NOT a terminal cell → attach falls back to streaming.
+    let (stdout, _) = cockpit(&d, "attach", ":quit\n");
+    assert!(
+        stdout.contains("done-late") || stdout.contains("exit 0"),
+        "stream-until-done: {stdout}"
+    );
+}
+
+// ---------- Raw-mode attach under a real PTY --------------------------------
+
+mod pty {
+    use super::*;
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::sync::{Arc, Mutex};
+
+    pub struct PtyClient {
+        pub child: Box<dyn portable_pty::Child + Send + Sync>,
+        pub writer: Box<dyn std::io::Write + Send>,
+        output: Arc<Mutex<String>>,
+        _master: Box<dyn portable_pty::MasterPty + Send>,
+    }
+
+    impl PtyClient {
+        /// Spawn `fern <args>` inside a fresh PTY wired to `dir`'s daemon.
+        pub fn spawn(dir: &Path, args: &[&str]) -> Self {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut cmd = CommandBuilder::new(super::bin());
+            cmd.args(args);
+            cmd.env("XDG_RUNTIME_DIR", dir.to_str().unwrap());
+            cmd.env("TERM", "xterm");
+            let child = pair.slave.spawn_command(cmd).unwrap();
+            drop(pair.slave);
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let writer = pair.master.take_writer().unwrap();
+            let output = Arc::new(Mutex::new(String::new()));
+            let sink = output.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut reader, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => sink
+                            .lock()
+                            .unwrap()
+                            .push_str(&String::from_utf8_lossy(&buf[..n])),
+                    }
+                }
+            });
+            Self {
+                child,
+                writer,
+                output,
+                _master: pair.master,
+            }
+        }
+
+        pub fn wait_for(&self, needle: &str) -> String {
+            let start = Instant::now();
+            loop {
+                let snap = self.output.lock().unwrap().clone();
+                if snap.contains(needle) {
+                    return snap;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "never saw {needle:?} in:\n{snap}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_attach_drives_a_live_terminal_and_detaches() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+    d.ok(&["run", "--detach", "cat"]);
+
+    let mut c = pty::PtyClient::spawn(&d.dir, &["attach", "main"]);
+    c.wait_for("driving cell");
+    c.writer.write_all(b"hello-raw-pty\r").unwrap();
+    c.writer.flush().unwrap();
+    c.wait_for("hello-raw-pty");
+    // Ctrl+] detaches; the cell keeps running and the cockpit exits.
+    c.writer.write_all(&[0x1d]).unwrap();
+    c.writer.flush().unwrap();
+    c.wait_for("detached");
+    let status = c.child.wait().unwrap();
+    assert!(status.success());
+
+    // The cat cell survived the detach; kill it from a plain client.
+    d.ok(&["kill", "2"]);
+}
+
+#[test]
+fn cockpit_on_tty_branch_runs_typed_commands_raw() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+
+    let mut c = pty::PtyClient::spawn(&d.dir, &["attach", "main"]);
+    c.wait_for("(on main) >");
+    // A typed external command on a tty branch launches detached + raw;
+    // `tty` proves the program really got a terminal.
+    c.writer.write_all(b"tty\r").unwrap();
+    c.writer.flush().unwrap();
+    c.wait_for("/dev/");
+    c.wait_for("(on main) >"); // back at the prompt after Completed
+    // Builtins stay inline on a tty branch.
+    c.writer.write_all(b"cd /tmp\r").unwrap();
+    c.writer.flush().unwrap();
+    c.writer.write_all(b":quit\r").unwrap();
+    c.writer.flush().unwrap();
+    let status = c.child.wait().unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn raw_attach_sees_completion_when_cell_killed_elsewhere() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+    d.ok(&["run", "--detach", "cat"]);
+
+    let mut c = pty::PtyClient::spawn(&d.dir, &["attach", "main"]);
+    c.wait_for("driving cell");
+    d.ok(&["kill", "2"]); // killed from another client → Completed flows to attacher
+    c.wait_for("(on main) >"); // follow() returns Completed, cockpit prompts
+    c.writer.write_all(b":quit\r").unwrap();
+    c.writer.flush().unwrap();
+    let status = c.child.wait().unwrap();
+    assert!(status.success());
+}
+
+// ---------- Client resilience against a broken daemon ----------------------
+
+/// A fake daemon that accepts one connection, optionally reads a line, sends
+/// a canned response (or nothing), and closes.
+fn mock_daemon(dir: &Path, reply: Option<&'static str>) {
+    let sock = dir.join("fern.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { break };
+            let mut line = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            if let Some(r) = reply {
+                let _ = conn.write_all(r.as_bytes());
+                let _ = conn.write_all(b"\n");
+            }
+            // close
+        }
+    });
+}
+
+#[test]
+fn client_rejects_unexpected_responses() {
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-mock-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    mock_daemon(&dir, Some(r#"{"kind":"ok"}"#));
+    for args in [&["tree"][..], &["branch"], &["run", "echo hi"]] {
+        let out = Command::new(bin())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "{args:?} should reject an Ok-for-everything daemon"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn client_reports_connection_closed_early() {
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-mock-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    mock_daemon(&dir, None); // accept, read, close without replying
+    for args in [
+        &["tree"][..],
+        &["branch"],
+        &["run", "echo hi"],
+        &["send", "main", "x"],
+    ] {
+        let out = Command::new(bin())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?} should fail on early close");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("closed") || stderr.contains("error"),
+            "{args:?} stderr: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
