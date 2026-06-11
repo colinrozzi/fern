@@ -43,6 +43,30 @@ pub fn write_current_branch(name: &str) {
     let _ = std::fs::write(current_branch_path(), name);
 }
 
+/// Resolve the branch an implicit (no `--branch`) command should land on.
+/// The daemon's tree is ephemeral but the current-branch file isn't, so after
+/// a daemon restart it can name a branch that no longer exists — in that case
+/// warn and fall back to the default branch instead of failing every command.
+/// An *explicitly* requested branch is never redirected; only the cursor heals.
+async fn resolve_current_branch() -> Result<String> {
+    let name = read_current_branch();
+    // The default branch always exists (seeded at root, undeletable) — skip
+    // the round-trip in the common case.
+    if name == DEFAULT_BRANCH {
+        return Ok(name);
+    }
+    let branches = fetch_branches().await?;
+    if branches.iter().any(|b| b.name == name) {
+        return Ok(name);
+    }
+    eprintln!(
+        "[fern] current branch '{name}' no longer exists (daemon restarted?) — \
+         falling back to '{DEFAULT_BRANCH}'"
+    );
+    write_current_branch(DEFAULT_BRANCH);
+    Ok(DEFAULT_BRANCH.to_string())
+}
+
 // ---------- Low-level RPCs ---------------------------------------------
 
 async fn connect() -> Result<UnixStream> {
@@ -73,7 +97,10 @@ where
     F: FnMut(Stream, &str),
 {
     let who = who.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "?".into()));
-    let branch = branch.unwrap_or_else(read_current_branch);
+    let branch = match branch {
+        Some(b) => b,
+        None => resolve_current_branch().await?,
+    };
 
     let mut stream = connect().await?;
     send_req(
@@ -154,7 +181,10 @@ pub async fn submit_detached(
     source: String,
 ) -> Result<CellId> {
     let who = who.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "?".into()));
-    let branch = branch.unwrap_or_else(read_current_branch);
+    let branch = match branch {
+        Some(b) => b,
+        None => resolve_current_branch().await?,
+    };
 
     let mut stream = connect().await?;
     send_req(
@@ -355,15 +385,20 @@ async fn branch_is_tty(name: &str) -> Result<bool> {
 pub async fn cockpit(target: Option<String>) -> Result<()> {
     use std::io::Write;
 
-    let mut branch = target.unwrap_or_else(read_current_branch);
-    {
-        let branches = fetch_branches().await?;
-        if !branches.iter().any(|b| b.name == branch) {
-            return Err(anyhow!(
-                "no such branch '{branch}' (create it with `fern branch new {branch}`)"
-            ));
+    // An explicit target must exist; the implicit cursor heals itself if the
+    // branch it names is gone (e.g. after a daemon restart).
+    let mut branch = match target {
+        Some(t) => {
+            let branches = fetch_branches().await?;
+            if !branches.iter().any(|b| b.name == t) {
+                return Err(anyhow!(
+                    "no such branch '{t}' (create it with `fern branch new {t}`)"
+                ));
+            }
+            t
         }
-    }
+        None => resolve_current_branch().await?,
+    };
     write_current_branch(&branch);
     println!("fern — attached to '{branch}'. :help for commands, :quit to leave.");
 
