@@ -130,6 +130,13 @@ async fn eval_command(
                 .canonicalize()
                 .map_err(|e| anyhow!("cd {}: {e}", target.display()))?;
             let mut ns = state.clone();
+            // Keep the conventional shell vars in sync with the move, so
+            // `$PWD` agrees with `pwd` and `cd -`-style tooling can see where
+            // we came from.
+            ns.env
+                .insert("OLDPWD".into(), state.cwd.to_string_lossy().into_owned());
+            ns.env
+                .insert("PWD".into(), canon.to_string_lossy().into_owned());
             ns.cwd = canon;
             Ok((ns, 0))
         }
@@ -668,6 +675,23 @@ mod tests {
         let (s, _o) = eval_line_collect(&st(), "cd /tmp").await.unwrap();
         // `cd` canonicalizes, so on macOS /tmp resolves to /private/tmp.
         assert_eq!(s.cwd, std::fs::canonicalize("/tmp").unwrap());
+    }
+
+    #[tokio::test]
+    async fn cd_syncs_pwd_and_oldpwd() {
+        let start = st();
+        let here = start.cwd.to_string_lossy().into_owned();
+        // baseline seeds $PWD with the starting cwd
+        assert_eq!(start.env.get("PWD"), Some(&here));
+
+        let (s, _o) = eval_line_collect(&start, "cd /tmp").await.unwrap();
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        assert_eq!(s.env.get("PWD"), Some(&tmp.to_string_lossy().into_owned()));
+        assert_eq!(s.env.get("OLDPWD"), Some(&here));
+
+        // ...and $PWD expands in a command, agreeing with `pwd`
+        let (_s, o) = eval_line_collect(&s, "echo $PWD").await.unwrap();
+        assert_eq!(out_str(&o).trim(), tmp.to_string_lossy());
     }
 
     #[tokio::test]
