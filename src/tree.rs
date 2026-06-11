@@ -16,7 +16,7 @@ use std::time::Instant;
 // ---------- State + Process ---------------------------------------------
 
 /// Inheritable context that flows down the cell tree.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
@@ -76,7 +76,7 @@ pub struct Output {
 
 // ---------- SystemInfo (baseline for the root cell's hash) -------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SystemInfo {
     pub os: String,
     pub arch: String,
@@ -246,6 +246,17 @@ impl Tree {
         self.cells.insert(id, cell);
         self.children.entry(parent).or_default().push(id);
         self.children.entry(id).or_default();
+    }
+
+    /// Re-insert a cell from the persistence log: same as `insert_cell`, but
+    /// also advances `next_id` past the restored id (the log is in completion
+    /// order, not id order). Returns the recomputed content hash so the
+    /// caller can verify it against the logged one — Merkle integrity for free.
+    pub fn restore_cell(&mut self, parent: CellId, cell: Cell) -> Option<Hash> {
+        let id = cell.id;
+        self.insert_cell(parent, cell);
+        self.next_id = self.next_id.max(id + 1);
+        self.cells.get(&id).and_then(|c| c.hash.clone())
     }
 
     /// Attach (or replace) the result of a cell previously inserted with
