@@ -97,14 +97,37 @@ pub async fn run(store_path: Option<std::path::PathBuf>, fresh: bool) -> Result<
         store: Mutex::new(store),
     });
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, state).await {
-                eprintln!("conn error: {e:#}");
-            }
-        });
+    let accept_loop = async {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_conn(stream, state).await {
+                    eprintln!("conn error: {e:#}");
+                }
+            });
+        }
+        // Unreachable, but gives the async block a concrete error type.
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+
+    // Exit cleanly on SIGTERM/SIGINT: running cells die with the daemon (their
+    // results were never persisted), but the socket is removed and the process
+    // unwinds normally — which also lets coverage/profiling data flush.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        res = accept_loop => res,
+        _ = sigterm.recv() => {
+            eprintln!("fern daemon: SIGTERM, shutting down");
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("fern daemon: interrupt, shutting down");
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
     }
 }
 
