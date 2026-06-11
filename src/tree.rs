@@ -396,7 +396,14 @@ mod tests {
     }
 
     fn cwd(t: &Tree, id: CellId) -> PathBuf {
-        t.get(id).unwrap().result.as_ref().unwrap().end_state.cwd.clone()
+        t.get(id)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()
+            .end_state
+            .cwd
+            .clone()
     }
 
     fn env_of(t: &Tree, id: CellId, key: &str) -> Option<String> {

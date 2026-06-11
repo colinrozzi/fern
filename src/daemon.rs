@@ -52,8 +52,7 @@ struct PtyHandle {
 pub async fn run() -> Result<()> {
     let path = socket_path();
     let _ = std::fs::remove_file(&path);
-    let listener =
-        UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
+    let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
 
     let sysinfo = SystemInfo::collect();
     eprintln!(
@@ -356,7 +355,10 @@ const FORK_PREFIX: &str = "fork-";
 /// Pick a unique `fork-<uuid>` branch name not already in use.
 fn gen_fork_name(t: &Tree) -> String {
     loop {
-        let name = format!("{FORK_PREFIX}{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let name = format!(
+            "{FORK_PREFIX}{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
         if !t.branch_exists(&name) {
             return name;
         }
@@ -712,13 +714,11 @@ async fn handle_attach(
                     None => return Ok(()),
                 };
                 if line.is_empty() { continue; }
-                if let Ok(req) = serde_json::from_str::<Request>(&line) {
-                    if let Request::Input { id: req_id, data } = req {
-                        if req_id == id {
+                if let Ok(req) = serde_json::from_str::<Request>(&line)
+                    && let Request::Input { id: req_id, data } = req
+                        && req_id == id {
                             let _ = pty_input.send(data.into_bytes());
                         }
-                    }
-                }
             }
         }
     }
@@ -826,6 +826,12 @@ mod tests {
 
         // The auto-generated names the daemon itself mints are exactly the ones
         // users are barred from, so they never collide with a user branch.
-        assert!(gen_fork_name(&Tree::new(State::baseline().unwrap(), SystemInfo::collect())).starts_with(FORK_PREFIX));
+        assert!(
+            gen_fork_name(&Tree::new(
+                State::baseline().unwrap(),
+                SystemInfo::collect()
+            ))
+            .starts_with(FORK_PREFIX)
+        );
     }
 }

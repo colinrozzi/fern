@@ -132,7 +132,9 @@ where
                 cell_parent = p;
                 report_fork(&branch, &landed);
             }
-            Response::Event(CellEvent::OutputChunk { stream: s, data, .. }) => {
+            Response::Event(CellEvent::OutputChunk {
+                stream: s, data, ..
+            }) => {
                 on_chunk(s, &data);
                 match s {
                     Stream::Stdout => stdout.push_str(&data),
@@ -337,21 +339,26 @@ async fn stream_until_done(id: CellId) -> Result<AttachOutcome> {
     let mut lines = BufReader::new(rd).lines();
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Response>(&line)? {
-            Response::Event(CellEvent::OutputChunk { id: i, stream: s, data }) if i == id => {
-                match s {
-                    Stream::Stdout => {
-                        print!("{data}");
-                        std::io::stdout().flush().ok();
-                    }
-                    Stream::Stderr => {
-                        eprint!("{data}");
-                        std::io::stderr().flush().ok();
-                    }
+            Response::Event(CellEvent::OutputChunk {
+                id: i,
+                stream: s,
+                data,
+            }) if i == id => match s {
+                Stream::Stdout => {
+                    print!("{data}");
+                    std::io::stdout().flush().ok();
                 }
-            }
-            Response::Event(CellEvent::Completed { id: i, exit_code, duration_ms, .. })
-                if i == id =>
-            {
+                Stream::Stderr => {
+                    eprint!("{data}");
+                    std::io::stderr().flush().ok();
+                }
+            },
+            Response::Event(CellEvent::Completed {
+                id: i,
+                exit_code,
+                duration_ms,
+                ..
+            }) if i == id => {
                 println!("[#{i} exit {exit_code} {duration_ms}ms]");
                 return Ok(AttachOutcome::Completed);
             }
@@ -417,7 +424,9 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
 
         print!("(on {branch}) > ");
         std::io::stdout().flush().ok();
-        let Some(line) = lines.next_line().await? else { break };
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
         let t = line.trim().to_string();
         if t.is_empty() {
             continue;
@@ -753,10 +762,7 @@ pub async fn switch(name: String) -> Result<()> {
 // ---------- Rendering helpers ------------------------------------------
 
 fn ensure_trailing_newline(stdout: &str, stderr: &str) {
-    let last = stderr
-        .chars()
-        .last()
-        .or_else(|| stdout.chars().last());
+    let last = stderr.chars().last().or_else(|| stdout.chars().last());
     if matches!(last, Some(c) if c != '\n') {
         println!();
     }
