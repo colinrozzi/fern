@@ -718,3 +718,497 @@ fn client_reports_connection_closed_early() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------- Daemon edge paths ----------------------------------------------
+
+#[test]
+fn submit_on_running_parent_is_rejected() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "--detach", "sleep 5"]);
+    let (_o, e) = d.err(&["run", "--parent", "1", "echo too-soon"]);
+    assert!(e.contains("hasn't finished"), "stderr: {e}");
+    d.ok(&["kill", "1"]);
+}
+
+#[test]
+fn eval_errors_become_exit_2_cells() {
+    let d = TestDaemon::start();
+    // Inline: the parse error streams to the client and exits 2.
+    let out = d.fern().args(["run", "echo $(oops"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unterminated"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Detached: same, recorded in the tree. Distinct marker so we don't match
+    // the inline error cell above.
+    d.ok(&["run", "--parent", "0", "--detach", "echo $(detached-oops"]);
+    let start = Instant::now();
+    loop {
+        let tree = d.ok(&["tree"]);
+        if tree
+            .lines()
+            .any(|l| l.contains("detached-oops") && l.contains("exit 2"))
+        {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "tree: {tree}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn fresh_flag_discards_the_store() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "echo doomed-history"]);
+    let dir = d.stop();
+
+    // Restart with --fresh: the old tree is gone.
+    let child = Command::new(bin())
+        .arg("daemon")
+        .arg("--store")
+        .arg(dir.join("tree.jsonl"))
+        .arg("--fresh")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let sock = dir.join("fern.sock");
+    let start = Instant::now();
+    while !sock.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let d2 = TestDaemon {
+        dir,
+        child: Some(child),
+    };
+    assert!(!d2.ok(&["tree"]).contains("doomed-history"));
+}
+
+#[test]
+fn sigint_also_shuts_down_cleanly() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "echo before-int"]);
+    let pid = d.child.as_ref().unwrap().id().to_string();
+    let _ = Command::new("kill").args(["-INT", &pid]).status();
+    // The daemon exits and removes its socket.
+    let start = Instant::now();
+    while d.dir.join("fern.sock").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "socket not removed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn tty_pipeline_is_not_attachable() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+    // A pipeline on a tty branch runs pipe-mode: tty cell, but no PTY ever
+    // registers. Attach waits for the verdict and reports it.
+    d.ok(&["run", "--detach", "sleep 0.4 | cat"]);
+    let (_o, e) = d.err(&["send", "main", "anything"]);
+    assert!(e.contains("no attachable terminal process"), "stderr: {e}");
+}
+
+#[test]
+fn empty_branch_name_is_rejected() {
+    let d = TestDaemon::start();
+    let (_o, e) = d.err(&["branch", "new", ""]);
+    assert!(e.contains("can't be empty"), "stderr: {e}");
+}
+
+// ---------- Fault injection -------------------------------------------------
+
+#[test]
+fn slow_subscriber_lag_recovery() {
+    // Tiny broadcast buffer so a stalled subscriber lags quickly.
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-lag-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let child = Command::new(bin())
+        .arg("daemon")
+        .arg("--store")
+        .arg(dir.join("tree.jsonl"))
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("FERN_EVENT_BUFFER", "8")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let sock = dir.join("fern.sock");
+    let start = Instant::now();
+    while !sock.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let d = TestDaemon {
+        dir,
+        child: Some(child),
+    };
+
+    // Subscribe but don't read: the daemon's forwarder fills the socket
+    // buffer, blocks, and falls behind the 8-event window → Lagged arm.
+    // Push enough bytes to actually fill a unix socket buffer (~200KB).
+    let mut stalled = std::os::unix::net::UnixStream::connect(d.dir.join("fern.sock")).unwrap();
+    stalled.write_all(b"{\"kind\":\"subscribe\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    d.ok(&["run", "bash -c 'yes fern-flood | head -c 500000'"]);
+    for i in 0..10 {
+        d.ok(&["run", &format!("echo flood-{i}")]);
+    }
+    // The stalled subscriber starts reading: connection must still be alive.
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(stalled);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(!line.is_empty(), "subscription died after lagging");
+    // Drop the half-read subscription, then generate one more event: the
+    // daemon's forwarder hits a write error and logs it without falling over.
+    drop(reader);
+    assert_eq!(d.ok(&["run", "echo after-flood"]).trim(), "after-flood");
+    assert_eq!(d.ok(&["run", "echo still-fine"]).trim(), "still-fine");
+
+    // Same trick against a raw *attach* loop: attach to a live tty cell,
+    // stall, flood — the attach forwarder's Lagged arm must also recover.
+    d.ok(&["run", "export FERN_IO=tty"]);
+    d.ok(&["run", "--detach", "cat"]);
+    let tree = d.ok(&["tree"]);
+    let cat_id = tree
+        .lines()
+        .find(|l| l.trim_start().starts_with('#') && l.contains(" cat "))
+        .and_then(|l| l.trim_start().strip_prefix('#'))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap()
+        .to_string();
+    let mut stalled_attach =
+        std::os::unix::net::UnixStream::connect(d.dir.join("fern.sock")).unwrap();
+    stalled_attach
+        .write_all(format!("{{\"kind\":\"attach\",\"id\":{cat_id}}}\n").as_bytes())
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100)); // let it reach the event loop
+    d.ok(&[
+        "run",
+        "--parent",
+        "0",
+        "bash -c 'yes lag2 | head -c 500000'",
+    ]);
+    for _ in 0..10 {
+        d.ok(&["run", "--parent", "0", "echo more"]);
+    }
+    stalled_attach
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(stalled_attach);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(!line.is_empty(), "attach died after lagging");
+    d.ok(&["kill", &cat_id]);
+}
+
+#[test]
+fn attach_survives_daemon_sigkill() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+    d.ok(&["run", "--detach", "cat"]);
+
+    let mut c = pty::PtyClient::spawn(&d.dir, &["attach", "main"]);
+    c.wait_for("driving cell");
+    // Hard-kill the daemon mid-attach: the client must notice and exit
+    // (with an error), not wedge in raw mode.
+    let pid = d.child.as_ref().unwrap().id().to_string();
+    let _ = Command::new("kill").args(["-9", &pid]).status();
+    std::thread::sleep(Duration::from_millis(200));
+    // Typing after the daemon died exercises the client's write-failure arm.
+    let _ = c.writer.write_all(b"too late\r");
+    let _ = c.writer.flush();
+    let status = c.child.wait().unwrap();
+    assert!(
+        !status.success(),
+        "client should exit nonzero after daemon death"
+    );
+}
+
+// ---------- Scripted daemon: already-completed tip ---------------------------
+
+/// A daemon impostor for one scenario: the branch tip reports running, but by
+/// the time the client attaches the cell has finished. Forces the cockpit
+/// through stream_until_done's snapshot-replay path deterministically.
+fn scripted_completed_tip_daemon(dir: &std::path::Path) {
+    use std::sync::atomic::AtomicU64 as Counter;
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("fern.sock")).unwrap();
+    let lb_count = std::sync::Arc::new(Counter::new(0));
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { break };
+            let mut line = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            if line.contains("list_branches") {
+                let n = lb_count.fetch_add(1, Ordering::SeqCst);
+                // First ask: tip running (so the cockpit follows it).
+                // Later asks: finished (so the cockpit prompts and exits).
+                let running = n == 0;
+                let resp = format!(
+                    "{{\"kind\":\"branches\",\"branches\":[{{\"name\":\"main\",\"tip\":1,\"tip_hash\":null,\"running\":{running},\"tty\":false}}]}}\n"
+                );
+                let _ = conn.write_all(resp.as_bytes());
+                held.push(conn); // keep open; cockpit may not re-read
+            } else if line.contains("attach") {
+                // The cell finished a moment ago.
+                let _ = conn
+                    .write_all(b"{\"kind\":\"error\",\"message\":\"cell #1 is not running\"}\n");
+            } else if line.contains("get_cell") {
+                // Response::Cell is an internally-tagged newtype: the snapshot
+                // fields sit inline next to "kind", not nested.
+                let _ = conn.write_all(
+                    b"{\"kind\":\"cell\",\"id\":1,\"parent\":0,\"submitter\":\"t\",\"source\":\"echo done\",\"exit_code\":0,\"duration_ms\":7,\"stdout\":\"stored-output\\n\",\"stderr\":\"\",\"hash\":\"abc123\"}\n",
+                );
+            } else if line.contains("subscribe") {
+                held.push(conn); // hold open silently
+            }
+        }
+    });
+}
+
+#[test]
+fn cockpit_replays_snapshot_when_tip_finished_during_attach() {
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-script-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("fern-branch"), "main").unwrap();
+    scripted_completed_tip_daemon(&dir);
+
+    let mut child = Command::new(bin())
+        .arg("attach")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Close stdin: after the snapshot replay the cockpit prompts and exits.
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("stored-output") && stdout.contains("[#1 exit 0 7ms]"),
+        "snapshot replay missing: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- More scripted-daemon scenarios ----------------------------------
+
+/// Mock where attach succeeds (raw mode engages) but the daemon then sends an
+/// Error event. The tip reports running only once so the cockpit exits to a
+/// prompt afterwards. Exercises follow()'s mid-attach error arm.
+fn scripted_attach_error_daemon(dir: &std::path::Path) {
+    use std::sync::atomic::AtomicU64 as Counter;
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("fern.sock")).unwrap();
+    let lb_count = std::sync::Arc::new(Counter::new(0));
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { break };
+            let mut line = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            if line.contains("list_branches") {
+                let running = lb_count.fetch_add(1, Ordering::SeqCst) == 0;
+                let resp = format!(
+                    "{{\"kind\":\"branches\",\"branches\":[{{\"name\":\"main\",\"tip\":1,\"tip_hash\":null,\"running\":{running},\"tty\":false}}]}}\n"
+                );
+                let _ = conn.write_all(resp.as_bytes());
+                held.push(conn);
+            } else if line.contains("attach") {
+                // Attach accepted... then the daemon reports an error event.
+                let _ = conn.write_all(b"{\"kind\":\"ok\"}\n");
+                let _ = conn.write_all(
+                    b"{\"kind\":\"error\",\"message\":\"synthetic mid-attach error\"}\n",
+                );
+                held.push(conn);
+            } else if line.contains("subscribe") {
+                held.push(conn);
+            }
+        }
+    });
+}
+
+#[test]
+fn follow_handles_mid_attach_error_event() {
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-script2-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("fern-branch"), "main").unwrap();
+    scripted_attach_error_daemon(&dir);
+
+    // Needs a PTY: follow only reaches the event loop once raw mode engages.
+    let mut c = pty::PtyClient::spawn(&dir, &["attach"]);
+    c.wait_for("synthetic mid-attach error");
+    c.wait_for("(on main) >");
+    c.writer.write_all(b":quit\r").unwrap();
+    c.writer.flush().unwrap();
+    let status = c.child.wait().unwrap();
+    assert!(status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Mock where the tip is running pipe-mode; attach is refused, the snapshot
+/// fetch errors, and the held subscription then streams stderr + Completed.
+fn scripted_streaming_daemon(dir: &std::path::Path) {
+    use std::sync::atomic::AtomicU64 as Counter;
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("fern.sock")).unwrap();
+    let lb_count = std::sync::Arc::new(Counter::new(0));
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { break };
+            let mut line = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            if line.contains("list_branches") {
+                let n = lb_count.fetch_add(1, Ordering::SeqCst);
+                let running = n == 0;
+                let resp = format!(
+                    "{{\"kind\":\"branches\",\"branches\":[{{\"name\":\"main\",\"tip\":1,\"tip_hash\":null,\"running\":{running},\"tty\":false}}]}}\n"
+                );
+                let _ = conn.write_all(resp.as_bytes());
+                held.push(conn);
+            } else if line.contains("attach") {
+                let _ = conn
+                    .write_all(b"{\"kind\":\"error\",\"message\":\"cell #1 is not running\"}\n");
+            } else if line.contains("get_cell") {
+                let _ = conn.write_all(b"{\"kind\":\"error\",\"message\":\"no such cell\"}\n");
+            } else if line.contains("subscribe") {
+                // First subscription is the cockpit feed (hold silently).
+                // The second belongs to stream_until_done: feed it chunks.
+                // Response::Event flattens: the inner CellEvent's own tag is
+                // "event", so the wire shape is {"kind":"event","event":"..."}.
+                if held.iter().len() >= 2 {
+                    let _ = conn.write_all(
+                        b"{\"kind\":\"event\",\"event\":\"output_chunk\",\"id\":1,\"stream\":\"stderr\",\"data\":\"late-noise\\n\"}\n",
+                    );
+                    let _ = conn.write_all(
+                        b"{\"kind\":\"event\",\"event\":\"completed\",\"id\":1,\"exit_code\":3,\"duration_ms\":9,\"hash\":null}\n",
+                    );
+                }
+                held.push(conn);
+            }
+        }
+    });
+}
+
+#[test]
+fn stream_until_done_renders_stderr_and_survives_snapshot_failure() {
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-script3-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("fern-branch"), "main").unwrap();
+    scripted_streaming_daemon(&dir);
+
+    let mut child = Command::new(bin())
+        .arg("attach")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("[#1 exit 3 9ms]"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("late-noise"), "stderr: {stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn detached_submit_handles_broken_daemons() {
+    // Error reply.
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-mockd-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    mock_daemon(&dir, Some(r#"{"kind":"error","message":"synthetic"}"#));
+    let out = Command::new(bin())
+        .args(["run", "--detach", "echo hi"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Closed before Started.
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-mockd-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    mock_daemon(&dir, None);
+    let out = Command::new(bin())
+        .args(["run", "--detach", "echo hi"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("closed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- StdinFeed edges --------------------------------------------------
+
+#[test]
+fn cockpit_runs_final_unterminated_line_on_eof() {
+    let d = TestDaemon::start();
+    // No trailing newline: the pump flushes the partial line at EOF.
+    let (stdout, _) = cockpit(&d, "attach", "echo no-trailing-newline");
+    assert!(stdout.contains("no-trailing-newline"), "got: {stdout}");
+}
+
+// ---------- Persistence guard -------------------------------------------------
+
+#[test]
+fn branch_deleted_while_cell_runs_is_not_resurrected() {
+    let d = TestDaemon::start();
+    d.ok(&["branch", "new", "doomed"]);
+    d.ok(&["run", "--branch", "doomed", "--detach", "sleep 0.5"]);
+    d.ok(&["branch", "rm", "doomed"]);
+    // Wait for the cell to complete; its SetBranch must be skipped.
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(!d.ok(&["branch"]).contains("doomed"));
+    // ...and stays gone across a restart (the log has no dangling SetBranch).
+    let dir = d.stop();
+    let d2 = TestDaemon::start_in(dir);
+    assert!(!d2.ok(&["branch"]).contains("doomed"));
+}

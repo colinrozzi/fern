@@ -83,14 +83,18 @@ pub struct Store {
 impl Store {
     /// `$XDG_DATA_HOME/fern/tree.jsonl`, falling back to `~/.local/share`.
     pub fn default_path() -> PathBuf {
-        let base = std::env::var("XDG_DATA_HOME")
+        Self::default_path_from(
+            std::env::var("XDG_DATA_HOME").ok(),
+            std::env::var("HOME").ok(),
+        )
+    }
+
+    /// Pure core of `default_path`, separated so the resolution order is
+    /// testable without mutating process env.
+    fn default_path_from(xdg_data_home: Option<String>, home: Option<String>) -> PathBuf {
+        let base = xdg_data_home
             .map(PathBuf::from)
-            .ok()
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".local/share"))
-            })
+            .or_else(|| home.map(|h| PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         base.join("fern").join("tree.jsonl")
     }
@@ -352,5 +356,105 @@ mod tests {
     #[test]
     fn empty_store_replays_to_none() {
         assert!(replay(&[]).is_none());
+    }
+
+    #[test]
+    fn default_path_resolution_order() {
+        // XDG_DATA_HOME wins.
+        assert_eq!(
+            Store::default_path_from(Some("/xdg".into()), Some("/home/u".into())),
+            PathBuf::from("/xdg/fern/tree.jsonl")
+        );
+        // HOME fallback.
+        assert_eq!(
+            Store::default_path_from(None, Some("/home/u".into())),
+            PathBuf::from("/home/u/.local/share/fern/tree.jsonl")
+        );
+        // Last-resort /tmp.
+        assert_eq!(
+            Store::default_path_from(None, None),
+            PathBuf::from("/tmp/fern/tree.jsonl")
+        );
+        // The env-reading wrapper produces the same shape.
+        assert!(Store::default_path().ends_with("fern/tree.jsonl"));
+    }
+
+    #[test]
+    fn replay_applies_branch_ops_and_skips_junk() {
+        let state = State::baseline().unwrap();
+        let cell = |id: CellId| Record::Cell {
+            id,
+            parent: 0,
+            submitter: "t".into(),
+            source: format!("echo {id}"),
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: 1,
+            end_state: state.clone(),
+            hash: "ignored".into(), // mismatch only warns; recomputed hash wins
+        };
+        let records = vec![
+            Record::Root {
+                state: state.clone(),
+                sysinfo: sys(),
+            },
+            cell(1),
+            cell(1), // duplicate id → skipped
+            Record::SetBranch {
+                name: "work".into(),
+                tip: 1,
+            },
+            Record::RenameBranch {
+                from: "work".into(),
+                to: "renamed".into(),
+            },
+            Record::SetBranch {
+                name: "doomed".into(),
+                tip: 1,
+            },
+            Record::DeleteBranch {
+                name: "doomed".into(),
+            },
+            // A second Root mid-log is ignored with a warning.
+            Record::Root {
+                state: state.clone(),
+                sysinfo: sys(),
+            },
+        ];
+        let tree = replay(&records).unwrap();
+        assert!(tree.get(1).is_some());
+        assert_eq!(tree.branch_tip("renamed"), Some(1));
+        assert!(!tree.branch_exists("work"));
+        assert!(!tree.branch_exists("doomed"));
+    }
+
+    #[test]
+    fn open_skips_blank_lines() {
+        let path = temp_log("blank");
+        std::fs::remove_file(&path).ok();
+        let (mut store, _) = Store::open(&path).unwrap();
+        store
+            .append(&Record::Root {
+                state: State::baseline().unwrap(),
+                sysinfo: sys(),
+            })
+            .unwrap();
+        drop(store);
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"\n   \n").unwrap();
+        drop(f);
+        let (_s, records) = Store::open(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_fails_on_uncreatable_dir() {
+        assert!(Store::open(Path::new("/proc/definitely/not/creatable/tree.jsonl")).is_err());
     }
 }

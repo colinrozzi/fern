@@ -96,21 +96,11 @@ async fn eval_command(
         return Ok((state.clone(), 0));
     }
 
-    let name = argv[0].as_str();
-    if !BUILTINS.contains(&name) {
-        // External command. I/O mode is inherited environment: a cell whose
-        // state carries FERN_IO=tty runs external commands under a PTY (so
-        // isatty-aware programs see a terminal). Redirects fall back to pipes.
-        if tty_mode(state) && c.redirects.is_empty() {
-            let exit = exec_under_pty(&argv, state, cell_id, events, pty_reg).await?;
-            return Ok(done(state.clone(), exit));
-        }
-        let proc = Process::from_state(state, argv);
-        let exit = exec_with_redirects(&proc, &c.redirects, state, cell_id, events).await?;
-        return Ok(done(state.clone(), exit));
-    }
-
-    match name {
+    // Dispatch: the named builtins run in-process; everything else is an
+    // external command. Keep the arms in sync with BUILTINS (the client uses
+    // it to classify lines without evaluating them).
+    let name = argv[0].clone();
+    match name.as_str() {
         "cd" => {
             if !c.redirects.is_empty() {
                 return Err(anyhow!("redirects on builtin not yet supported"));
@@ -159,7 +149,19 @@ async fn eval_command(
             }
             Ok(done(ns, 0))
         }
-        _ => unreachable!("non-builtin `{name}` reached builtin dispatch"),
+        _ => {
+            // External command. I/O mode is inherited environment: a cell
+            // whose state carries FERN_IO=tty runs external commands under a
+            // PTY (so isatty-aware programs see a terminal). Redirects fall
+            // back to the pipe path.
+            if tty_mode(state) && c.redirects.is_empty() {
+                let exit = exec_under_pty(&argv, state, cell_id, events, pty_reg).await?;
+                return Ok(done(state.clone(), exit));
+            }
+            let proc = Process::from_state(state, argv);
+            let exit = exec_with_redirects(&proc, &c.redirects, state, cell_id, events).await?;
+            Ok(done(state.clone(), exit))
+        }
     }
 }
 
@@ -226,10 +228,8 @@ async fn eval_pipeline(
     cell_id: CellId,
     events: &mpsc::Sender<CellEvent>,
 ) -> Result<(State, i32)> {
-    if cmds.len() == 1 {
-        return eval_command(state, &cmds[0], cell_id, events, None).await;
-    }
-
+    // The parser only builds Pipe for `a | b | ...` (≥2 stages); a single
+    // command parses to Stmt::Cmd and never reaches here.
     let mut prev_stdout: Option<std::process::Stdio> = None;
     let mut children: Vec<tokio::process::Child> = Vec::with_capacity(cmds.len());
     let mut stream_tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
@@ -321,7 +321,7 @@ async fn apply_last_stdout_redirect(
     for r in redirects {
         if r.fd == 1 && matches!(r.op, RedirOp::Out | RedirOp::Append) {
             let path = expand_word(&r.target, state, cell_id, events).await?;
-            let f = open_for_write(&path, r.op).await?;
+            let f = open_for_write(&path, matches!(r.op, RedirOp::Append)).await?;
             p.stdout(Stdio::from(f.into_std().await));
             handled = true;
         }
@@ -361,12 +361,12 @@ async fn exec_with_redirects(
                 stdin_set = true;
             }
             (1, op @ (RedirOp::Out | RedirOp::Append)) => {
-                let f = open_for_write(&path, op).await?;
+                let f = open_for_write(&path, matches!(op, RedirOp::Append)).await?;
                 p.stdout(Stdio::from(f.into_std().await));
                 stdout_to_file = true;
             }
             (2, op @ (RedirOp::Out | RedirOp::Append)) => {
-                let f = open_for_write(&path, op).await?;
+                let f = open_for_write(&path, matches!(op, RedirOp::Append)).await?;
                 p.stderr(Stdio::from(f.into_std().await));
                 stderr_to_file = true;
             }
@@ -506,18 +506,21 @@ async fn exec_under_pty(
     Ok(status.exit_code() as i32)
 }
 
-async fn open_for_write(path: &str, op: RedirOp) -> Result<File> {
-    match op {
-        RedirOp::Out => File::create(path)
-            .await
-            .map_err(|e| anyhow!("> {}: {e}", path)),
-        RedirOp::Append => OpenOptions::new()
+/// Open a redirect target for writing. `append` selects `>>` over `>`; the
+/// input case never reaches here (callers match Out|Append), so the parameter
+/// is a bool rather than the full RedirOp.
+async fn open_for_write(path: &str, append: bool) -> Result<File> {
+    if append {
+        OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
             .await
-            .map_err(|e| anyhow!(">> {}: {e}", path)),
-        RedirOp::In => unreachable!(),
+            .map_err(|e| anyhow!(">> {}: {e}", path))
+    } else {
+        File::create(path)
+            .await
+            .map_err(|e| anyhow!("> {}: {e}", path))
     }
 }
 
@@ -751,6 +754,179 @@ mod tests {
     fn cmd_substitution_parse_errors_are_eager() {
         // Unterminated $( is a parse error, not an eval-time surprise.
         assert!(crate::parse::parse("echo $(oops").is_err());
+    }
+
+    #[tokio::test]
+    async fn and_continues_on_success() {
+        let (_s, o) = eval_line_collect(&st(), "true && echo continued")
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "continued");
+    }
+
+    #[test]
+    fn redirect_only_line_classifies_as_builtin() {
+        // Empty argv spawns nothing, so it needs no terminal.
+        assert!(is_pure_builtin_line("> /tmp/x"));
+    }
+
+    #[tokio::test]
+    async fn pty_mode_passes_multiple_args() {
+        let mut tty = st();
+        tty.env.insert("FERN_IO".into(), "tty".into());
+        let (_s, o) = eval_line_collect(&tty, "echo several pty args")
+            .await
+            .unwrap();
+        assert!(out_str(&o).contains("several pty args"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_stage_stderr_is_collected() {
+        // Stage stderr flows to the cell's stderr stream.
+        let (_s, o) = eval_line_collect(&st(), "bash -c 'echo oops >&2; echo fine' | cat")
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "fine");
+        assert!(String::from_utf8_lossy(&o.stderr).contains("oops"));
+        // Known gap: non-stdout redirects on pipeline stages are currently
+        // ignored (only the last stage's `>`/`>>` is applied).
+    }
+
+    #[tokio::test]
+    async fn unset_builtin_removes_vars() {
+        let (s, o) = eval_line_collect(&st(), "export FOO=1 BAR=2; unset FOO; echo [$FOO][$BAR]")
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "[][2]");
+        assert!(!s.env.contains_key("FOO"));
+        assert_eq!(s.env.get("BAR").map(String::as_str), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn cd_error_and_home_paths() {
+        // Nonexistent target.
+        assert!(
+            eval_line_collect(&st(), "cd /definitely/not/a/real/dir")
+                .await
+                .is_err()
+        );
+        // Bare `cd` without HOME errors...
+        let mut no_home = st();
+        no_home.env.remove("HOME");
+        assert!(eval_line_collect(&no_home, "cd").await.is_err());
+        // ...and with HOME goes there.
+        let mut with_home = st();
+        with_home.env.insert("HOME".into(), "/tmp".into());
+        let (s, _o) = eval_line_collect(&with_home, "cd").await.unwrap();
+        assert_eq!(s.cwd, std::fs::canonicalize("/tmp").unwrap());
+        // Relative cd resolves against the current cwd.
+        let (s, _o) = eval_line_collect(&s, "cd ..").await.unwrap();
+        assert_eq!(s.cwd, PathBuf::from("/"));
+        // Redirects on builtins are rejected.
+        assert!(
+            eval_line_collect(&st(), "cd /tmp > /dev/null")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_variants() {
+        let base = std::env::temp_dir().join(format!("fern-ev-{}", std::process::id()));
+        let p_app = format!("{}-app", base.display());
+        let p_err = format!("{}-err", base.display());
+        let p_pipe = format!("{}-pipe", base.display());
+
+        // Append accumulates.
+        let line = format!("echo one > {p_app}; echo two >> {p_app}");
+        let (_s, o) = eval_line_collect(&st(), &line).await.unwrap();
+        assert_eq!(o.exit_code, 0);
+        assert_eq!(std::fs::read_to_string(&p_app).unwrap(), "one\ntwo\n");
+
+        // Stderr redirect captures only stderr.
+        let line = format!("bash -c 'echo noise >&2; echo signal' 2> {p_err}");
+        let (_s, o) = eval_line_collect(&st(), &line).await.unwrap();
+        assert_eq!(out_str(&o).trim(), "signal");
+        assert_eq!(std::fs::read_to_string(&p_err).unwrap().trim(), "noise");
+
+        // Stdout redirect on the last pipeline stage.
+        let line = format!("echo plumbed | cat > {p_pipe}");
+        let (_s, o) = eval_line_collect(&st(), &line).await.unwrap();
+        assert_eq!(o.exit_code, 0);
+        assert_eq!(std::fs::read_to_string(&p_pipe).unwrap().trim(), "plumbed");
+
+        // Unsupported fd.
+        let res = eval_line_collect(&st(), "echo hi 3> /tmp/fern-unsupported").await;
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("unsupported redirect")
+        );
+
+        // Missing input file.
+        assert!(
+            eval_line_collect(&st(), "cat < /no/such/fern/file")
+                .await
+                .is_err()
+        );
+
+        for p in [p_app, p_err, p_pipe] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_failures_error() {
+        // Plain command.
+        assert!(
+            eval_line_collect(&st(), "definitely-not-a-real-command-xyz")
+                .await
+                .is_err()
+        );
+        // Pipeline stage.
+        assert!(
+            eval_line_collect(&st(), "echo hi | definitely-not-a-real-command-xyz")
+                .await
+                .is_err()
+        );
+        // PTY mode hits a different spawn path.
+        let mut tty = st();
+        tty.env.insert("FERN_IO".into(), "tty".into());
+        assert!(
+            eval_line_collect(&tty, "definitely-not-a-real-command-xyz")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_and_redirect_only_lines_are_noops() {
+        // Comment-only parses to no statement.
+        let (_s, o) = eval_line_collect(&st(), "# just a comment").await.unwrap();
+        assert_eq!(o.exit_code, 0);
+        assert!(out_str(&o).is_empty());
+        // A redirect with no command words has empty argv: no-op by design.
+        let p = std::env::temp_dir().join(format!("fern-noop-{}", std::process::id()));
+        let line = format!("> {}", p.display());
+        let (_s, o) = eval_line_collect(&st(), &line).await.unwrap();
+        assert_eq!(o.exit_code, 0);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[tokio::test]
+    async fn short_circuit_preserves_state_and_exit() {
+        // `&&` short-circuit returns the failing side's state/exit.
+        let (s, o) = eval_line_collect(&st(), "export X=1; false && export X=2")
+            .await
+            .unwrap();
+        assert_eq!(o.exit_code, 1);
+        assert_eq!(s.env.get("X").map(String::as_str), Some("1"));
+        // `||` short-circuit on success.
+        let (s, o) = eval_line_collect(&st(), "export Y=1; true || export Y=2")
+            .await
+            .unwrap();
+        assert_eq!(o.exit_code, 0);
+        assert_eq!(s.env.get("Y").map(String::as_str), Some("1"));
     }
 
     #[test]

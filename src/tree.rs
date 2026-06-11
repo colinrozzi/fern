@@ -214,14 +214,16 @@ impl Tree {
     /// Rename `from` → `to`, preserving the tip. Returns false if `from`
     /// doesn't exist or `to` already does.
     pub fn rename_branch(&mut self, from: &str, to: &str) -> bool {
-        if !self.branches.contains_key(from) || self.branches.contains_key(to) {
+        if self.branches.contains_key(to) {
             return false;
         }
-        if let Some(id) = self.branches.remove(from) {
-            self.branches.insert(to.to_string(), id);
-            return true;
+        match self.branches.remove(from) {
+            Some(id) => {
+                self.branches.insert(to.to_string(), id);
+                true
+            }
+            None => false,
         }
-        false
     }
 
     /// All branches as (name, tip) pairs, sorted by name.
@@ -477,6 +479,24 @@ mod tests {
         assert_eq!(out(&t, a).trim(), "6"); // "hello\n" = 6 bytes
         let b = run(&mut t, 0, "false || echo recovered").await;
         assert_eq!(out(&t, b).trim(), "recovered");
+    }
+
+    #[tokio::test]
+    async fn eval_errors_become_exit_2_cells() {
+        // A line that fails to even parse still produces a recorded cell:
+        // exit 2, the error on stderr, state inherited from the parent.
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
+        let id = t
+            .submit(0, "test".into(), "echo $(oops".into())
+            .await
+            .unwrap();
+        let r = t.get(id).unwrap().result.as_ref().unwrap();
+        assert_eq!(r.exit_code, 2);
+        assert!(
+            String::from_utf8_lossy(&r.stderr).contains("unterminated"),
+            "stderr: {:?}",
+            String::from_utf8_lossy(&r.stderr)
+        );
     }
 
     // ---------- Hash tests --------------------------------------------
