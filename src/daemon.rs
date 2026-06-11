@@ -4,7 +4,6 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -89,7 +88,14 @@ pub async fn run(store_path: Option<std::path::PathBuf>, fresh: bool) -> Result<
         restored,
     );
 
-    let (events, _) = broadcast::channel(4096);
+    // Broadcast buffer: a subscriber that falls more than this many events
+    // behind sees Lagged and skips forward. Tunable so tests can exercise the
+    // lagged paths without flooding thousands of events.
+    let cap = std::env::var("FERN_EVENT_BUFFER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    let (events, _) = broadcast::channel(cap);
     let state = Arc::new(DaemonState {
         tree: Mutex::new(tree),
         events,
@@ -99,7 +105,10 @@ pub async fn run(store_path: Option<std::path::PathBuf>, fresh: bool) -> Result<
 
     let accept_loop = async {
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => break Err(anyhow::Error::from(e)),
+            };
             let state = state.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_conn(stream, state).await {
@@ -107,9 +116,6 @@ pub async fn run(store_path: Option<std::path::PathBuf>, fresh: bool) -> Result<
                 }
             });
         }
-        // Unreachable, but gives the async block a concrete error type.
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
     };
 
     // Exit cleanly on SIGTERM/SIGINT: running cells die with the daemon (their
@@ -784,11 +790,10 @@ async fn handle_attach(
             if ac.finished.load(Ordering::SeqCst) {
                 break None;
             }
-            tokio::select! {
-                _ = notified.as_mut() => {}
-                // Safety net against a missed wakeup; registration is normally ms.
-                _ = tokio::time::sleep(Duration::from_secs(5)) => break None,
-            }
+            // `enable()` armed the notification before the checks above, so a
+            // registration or completion can't slip through the gap — this
+            // wait always wakes.
+            notified.as_mut().await;
             notified.set(ac.ready.notified());
         }
     };

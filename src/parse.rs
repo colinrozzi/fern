@@ -437,10 +437,7 @@ impl Parser {
         let mut redirects = Vec::new();
 
         loop {
-            if let Some(Tok::IoNumber(_)) = self.peek() {
-                let Tok::IoNumber(fd) = self.advance() else {
-                    unreachable!()
-                };
+            if let Some(fd) = self.take_io_number() {
                 let op = match self.advance_or("expected < or > after fd number")? {
                     Tok::Less => RedirOp::In,
                     Tok::Great => RedirOp::Out,
@@ -456,10 +453,9 @@ impl Parser {
             }
             match self.peek() {
                 Some(Tok::Word(_)) => {
-                    let Tok::Word(w) = self.advance() else {
-                        unreachable!()
-                    };
-                    words.push(w);
+                    if let Tok::Word(w) = self.advance() {
+                        words.push(w);
+                    }
                 }
                 Some(Tok::Less) => {
                     self.advance();
@@ -504,6 +500,17 @@ impl Parser {
             return Err(anyhow!("empty command"));
         }
         Ok(Command { words, redirects })
+    }
+
+    /// Atomically take an IoNumber token if that's what's next.
+    fn take_io_number(&mut self) -> Option<i32> {
+        if let Some(Tok::IoNumber(n)) = self.peek() {
+            let n = *n;
+            self.pos += 1;
+            Some(n)
+        } else {
+            None
+        }
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -553,6 +560,131 @@ mod tests {
     fn bare_words() {
         let s = parse("ls -la foo").unwrap().unwrap();
         assert_eq!(cmd_words(&s), vec![w("ls"), w("-la"), w("foo")]);
+    }
+
+    #[test]
+    fn braced_vars_and_dollar_errors() {
+        let s = parse("echo ${HOME}x").unwrap().unwrap();
+        assert_eq!(
+            cmd_words(&s)[1],
+            Word {
+                segments: vec![Segment::Var("HOME".into()), Segment::Literal("x".into())]
+            }
+        );
+        assert!(parse("echo ${}").is_err()); // empty name
+        assert!(parse("echo ${unclosed").is_err()); // missing }
+        assert!(parse("echo $%").is_err()); // $ followed by junk
+    }
+
+    #[test]
+    fn double_quote_escapes() {
+        // \$ suppresses expansion; unknown escapes keep the backslash.
+        let s = parse(r#"echo "a\$b""#).unwrap().unwrap();
+        assert_eq!(cmd_words(&s)[1], w("a$b"));
+        let s = parse(r#"echo "a\qb""#).unwrap().unwrap();
+        assert_eq!(cmd_words(&s)[1], w("a\\qb"));
+        let s = parse(r#"echo "a\\b""#).unwrap().unwrap();
+        assert_eq!(cmd_words(&s)[1], w("a\\b"));
+        assert!(parse(r#"echo "unterminated"#).is_err());
+    }
+
+    #[test]
+    fn bareword_escapes_and_quote_errors() {
+        let s = parse(r"echo a\ b").unwrap().unwrap();
+        assert_eq!(cmd_words(&s)[1], w("a b"));
+        assert!(parse("echo 'unterminated").is_err());
+    }
+
+    #[test]
+    fn cmdsub_scanner_edges() {
+        // Quoted close-parens don't end the scan.
+        assert!(parse(r#"echo $(echo "a)b")"#).unwrap().is_some());
+        assert!(parse("echo $(echo 'c)d')").unwrap().is_some());
+        // Escaped close-paren is skipped.
+        assert!(parse(r"echo $(echo \))").unwrap().is_some());
+        // Statement lists nest fine.
+        assert!(
+            parse("echo $(true; echo deep && echo er)")
+                .unwrap()
+                .is_some()
+        );
+        // Unterminated.
+        assert!(parse("echo $(oops").is_err());
+        // Empty substitution is an empty literal.
+        let s = parse("echo $()").unwrap().unwrap();
+        assert_eq!(cmd_words(&s)[1], w(""));
+    }
+
+    #[test]
+    fn io_numbers_and_digit_words() {
+        // fd-prefixed redirect.
+        let s = parse("echo hi 2> /tmp/e").unwrap().unwrap();
+        match &s {
+            Stmt::Cmd(c) => {
+                assert_eq!(c.redirects.len(), 1);
+                assert_eq!(c.redirects[0].fd, 2);
+            }
+            _ => panic!("not a cmd"),
+        }
+        // Multi-digit fd.
+        let s = parse("echo hi 12> /tmp/e").unwrap().unwrap();
+        match &s {
+            Stmt::Cmd(c) => assert_eq!(c.redirects[0].fd, 12),
+            _ => panic!("not a cmd"),
+        }
+        // Digits NOT followed by < or > are an ordinary word.
+        let s = parse("echo 2x").unwrap().unwrap();
+        assert_eq!(cmd_words(&s)[1], w("2x"));
+    }
+
+    #[test]
+    fn statement_level_errors() {
+        assert!(parse("echo >").is_err()); // redirect without target
+        assert!(parse("echo a |").is_err()); // trailing pipe
+        assert!(parse("| echo").is_err()); // leading pipe
+        assert!(parse("echo a &&").is_err()); // dangling &&
+        assert!(parse("&& echo").is_err()); // leading &&
+        assert!(parse("echo bg &").is_err()); // background unsupported
+        assert!(parse("echo <").is_err()); // < without target
+        assert!(parse("echo >>").is_err()); // >> without target
+        assert!(parse("echo 2>").is_err()); // fd redirect without target
+        assert!(parse("echo 2> >").is_err()); // fd redirect with non-word target
+        assert!(parse("echo > >").is_err()); // > with non-word target
+        assert!(parse("echo < <").is_err()); // < with non-word target
+        assert!(parse("echo >> >>").is_err()); // >> with non-word target
+        assert!(parse("echo 2 |").is_err()); // pipe into nothing (word "2")
+        assert!(parse("echo ; ;").is_err()); // empty command between semis
+        assert!(parse("echo 99999999999999999999> f").is_err()); // io number overflow
+    }
+
+    #[test]
+    fn input_fd_redirects_and_or_chains() {
+        // fd-prefixed input redirect (0< file).
+        let s = parse("cat 0< /etc/hostname").unwrap().unwrap();
+        match &s {
+            Stmt::Cmd(c) => {
+                assert_eq!(c.redirects[0].fd, 0);
+                assert_eq!(c.redirects[0].op, RedirOp::In);
+            }
+            _ => panic!("not a cmd"),
+        }
+        // Chained && / || mixes associate left.
+        assert!(parse("true && false || echo saved").unwrap().is_some());
+    }
+
+    #[test]
+    fn trailing_semi_and_multiline_comment() {
+        // Trailing semicolon is fine.
+        let s = parse("echo done ;").unwrap().unwrap();
+        assert_eq!(cmd_words(&s), vec![w("echo"), w("done")]);
+        // Comments end at a newline; parsing continues after.
+        let s = parse("# leading note\necho after").unwrap().unwrap();
+        assert_eq!(cmd_words(&s), vec![w("echo"), w("after")]);
+    }
+
+    #[test]
+    fn dquote_backslash_at_end_is_unterminated() {
+        assert!(parse("echo \"a\\").is_err());
     }
 
     #[test]

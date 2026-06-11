@@ -47,4 +47,4 @@ jobs:
       # Coverage ratchet: the floor only moves UP. When you add tests, raise
       # --fail-under-lines to the new measured floor (rounded down). Target: 100.
       - name: Coverage (ratchet)
-        run: cargo llvm-cov --summary-only --fail-under-lines 90
+        run: cargo llvm-cov --summary-only --fail-under-lines 96
