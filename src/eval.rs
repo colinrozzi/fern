@@ -88,7 +88,10 @@ async fn eval_command(
     events: &mpsc::Sender<CellEvent>,
     pty_reg: Option<&mpsc::UnboundedSender<PtyRegistration>>,
 ) -> Result<(State, i32)> {
-    let argv: Vec<String> = c.words.iter().map(|w| expand_word(w, state)).collect();
+    let mut argv = Vec::with_capacity(c.words.len());
+    for w in &c.words {
+        argv.push(expand_word(w, state, cell_id, events).await?);
+    }
     if argv.is_empty() {
         return Ok((state.clone(), 0));
     }
@@ -232,7 +235,10 @@ async fn eval_pipeline(
     let mut stream_tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
 
     for (i, cmd) in cmds.iter().enumerate() {
-        let argv: Vec<String> = cmd.words.iter().map(|w| expand_word(w, state)).collect();
+        let mut argv = Vec::with_capacity(cmd.words.len());
+        for w in &cmd.words {
+            argv.push(expand_word(w, state, cell_id, events).await?);
+        }
         if argv.is_empty() {
             return Err(anyhow!("empty command in pipeline"));
         }
@@ -255,7 +261,7 @@ async fn eval_pipeline(
         if !is_last {
             p.stdout(Stdio::piped());
         } else {
-            apply_last_stdout_redirect(&mut p, &cmd.redirects, state).await?;
+            apply_last_stdout_redirect(&mut p, &cmd.redirects, state, cell_id, events).await?;
         }
         p.stderr(Stdio::piped());
         // Kill the child if its future is dropped (e.g. detached cell aborted
@@ -308,11 +314,13 @@ async fn apply_last_stdout_redirect(
     p: &mut TCmd,
     redirects: &[Redirect],
     state: &State,
+    cell_id: CellId,
+    events: &mpsc::Sender<CellEvent>,
 ) -> Result<()> {
     let mut handled = false;
     for r in redirects {
         if r.fd == 1 && matches!(r.op, RedirOp::Out | RedirOp::Append) {
-            let path = expand_word(&r.target, state);
+            let path = expand_word(&r.target, state, cell_id, events).await?;
             let f = open_for_write(&path, r.op).await?;
             p.stdout(Stdio::from(f.into_std().await));
             handled = true;
@@ -343,7 +351,7 @@ async fn exec_with_redirects(
     let mut stderr_to_file = false;
 
     for r in redirects {
-        let path = expand_word(&r.target, state);
+        let path = expand_word(&r.target, state, cell_id, events).await?;
         match (r.fd, r.op) {
             (0, RedirOp::In) => {
                 let f = File::open(&path)
@@ -537,7 +545,15 @@ async fn stream_pipe<R: AsyncRead + Unpin>(
     }
 }
 
-fn expand_word(w: &Word, state: &State) -> String {
+/// Expand a word's segments. Async because `$(...)` evaluates a nested
+/// statement. Not directly recursive — the cycle through eval_stmt is boxed
+/// by its #[async_recursion].
+async fn expand_word(
+    w: &Word,
+    state: &State,
+    cell_id: CellId,
+    events: &mpsc::Sender<CellEvent>,
+) -> Result<String> {
     let mut out = String::new();
     for seg in &w.segments {
         match seg {
@@ -550,9 +566,56 @@ fn expand_word(w: &Word, state: &State) -> String {
                     out.push_str(v);
                 }
             }
+            Segment::CmdSub(stmt) => {
+                out.push_str(&run_substitution(stmt, state, cell_id, events).await?);
+            }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Run a `$(...)` substitution with subshell semantics: the inner statement
+/// evaluates against a clone of the state, so `cd`/`export` inside don't
+/// escape, and FERN_IO is stripped (captured output is never a terminal —
+/// same as bash, where a command substitution doesn't get the tty). Stdout
+/// is captured (trailing newlines stripped, like bash); stderr chunks pass
+/// through to the cell's stream. The inner exit code is discarded.
+async fn run_substitution(
+    stmt: &Stmt,
+    state: &State,
+    cell_id: CellId,
+    events: &mpsc::Sender<CellEvent>,
+) -> Result<String> {
+    let mut sub_state = state.clone();
+    sub_state.env.remove("FERN_IO");
+
+    let (tx, mut rx) = mpsc::channel::<CellEvent>(128);
+    let outer = events.clone();
+    let collect = async move {
+        let mut stdout = String::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                CellEvent::OutputChunk {
+                    stream: Stream::Stdout,
+                    data,
+                    ..
+                } => stdout.push_str(&data),
+                // Let stderr (and anything else) flow out to the cell.
+                ev => {
+                    let _ = outer.send(ev).await;
+                }
+            }
+        }
+        stdout
+    };
+    let eval = async {
+        let res = eval_stmt(&sub_state, stmt, cell_id, &tx, None).await;
+        drop(tx); // close the channel so collect finishes
+        res
+    };
+    let (res, stdout) = tokio::join!(eval, collect);
+    res?;
+    Ok(stdout.trim_end_matches('\n').to_string())
 }
 
 // ---------- Helpers for tests + non-streaming callers --------------------
@@ -633,6 +696,61 @@ mod tests {
         assert_eq!(s.last_exit, 7);
         let (_s, o) = eval_line_collect(&s, "echo $?").await.unwrap();
         assert_eq!(out_str(&o).trim(), "7");
+    }
+
+    #[tokio::test]
+    async fn cmd_substitution_basic() {
+        let (_s, o) = eval_line_collect(&st(), "echo $(echo hi)").await.unwrap();
+        assert_eq!(out_str(&o).trim(), "hi");
+        // Splices into a word, trailing newline stripped.
+        let (_s, o) = eval_line_collect(&st(), "echo a$(echo b)c").await.unwrap();
+        assert_eq!(out_str(&o).trim(), "abc");
+        // Inside double quotes.
+        let (_s, o) = eval_line_collect(&st(), r#"echo "x=$(echo y)""#)
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "x=y");
+    }
+
+    #[tokio::test]
+    async fn cmd_substitution_nests() {
+        let (_s, o) = eval_line_collect(&st(), "echo $(echo $(echo deep))")
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "deep");
+    }
+
+    #[tokio::test]
+    async fn cmd_substitution_is_a_subshell() {
+        // cd inside $() must not leak into the outer state.
+        let before = st();
+        let (s, _o) = eval_line_collect(&before, "echo $(cd /tmp)").await.unwrap();
+        assert_eq!(s.cwd, before.cwd);
+        // ...and the canonical bash idiom works: capture pwd into the env.
+        let (s, _o) = eval_line_collect(&st(), "cd /tmp; export HERE=$(pwd); cd /; echo $HERE")
+            .await
+            .unwrap();
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        assert_eq!(s.env.get("HERE"), Some(&tmp.to_string_lossy().into_owned()));
+    }
+
+    #[tokio::test]
+    async fn cmd_substitution_stderr_passes_through() {
+        let (_s, o) = eval_line_collect(&st(), "echo got:$(bash -c 'echo noise >&2; echo signal')")
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "got:signal");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("noise"),
+            "stderr should pass through; got {:?}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
+    #[test]
+    fn cmd_substitution_parse_errors_are_eager() {
+        // Unterminated $( is a parse error, not an eval-time surprise.
+        assert!(crate::parse::parse("echo $(oops").is_err());
     }
 
     #[test]
