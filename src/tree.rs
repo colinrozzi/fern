@@ -20,6 +20,10 @@ use std::time::Instant;
 pub struct State {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// Exit code of the most recent command — what `$?` expands to. Part of
+    /// inheritable state like cwd/env: a child cell sees how its parent
+    /// exited, and it updates as statements run within a line.
+    pub last_exit: i32,
 }
 
 impl State {
@@ -35,7 +39,11 @@ impl State {
         // Seed $PWD from the actual cwd (not the inherited env) so the root
         // state is internally consistent; `cd` keeps it in sync from there.
         env.insert("PWD".into(), cwd.to_string_lossy().into_owned());
-        Ok(Self { cwd, env })
+        Ok(Self {
+            cwd,
+            env,
+            last_exit: 0,
+        })
     }
 }
 
@@ -331,6 +339,7 @@ fn h_state(h: &mut Sha256, state: &State) {
         h_str(h, k);
         h_str(h, v);
     }
+    h.update(state.last_exit.to_le_bytes());
 }
 
 fn to_hex(bytes: &[u8]) -> String {
