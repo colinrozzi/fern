@@ -419,13 +419,16 @@ async fn run_inline(
 
     let (eval_result, fwd_result) = tokio::join!(eval_fut, forward_fut);
     let mut error_msg: Option<String> = None;
-    let (new_state, exit_code) = match eval_result {
+    let (mut new_state, exit_code) = match eval_result {
         Ok(r) => r,
         Err(e) => {
             error_msg = Some(format!("{e}\n"));
             (parent_state.clone(), 2)
         }
     };
+    // Invariant on every path (including eval errors): the recorded end_state
+    // carries this cell's exit code, so a child cell's `$?` is always truthful.
+    new_state.last_exit = exit_code;
     let (stdout, mut stderr) = fwd_result?;
     if let Some(msg) = error_msg {
         // Broadcast a chunk so watchers see why the cell died too.
@@ -549,6 +552,10 @@ async fn start_detached(
                 (parent_state.clone(), 2)
             }
         };
+        // Same invariant as the inline path: end_state always carries the
+        // cell's exit code so children's `$?` is truthful.
+        let mut new_state = new_state;
+        new_state.last_exit = exit_code;
         let duration = started.elapsed();
 
         let hash = {
