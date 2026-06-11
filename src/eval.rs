@@ -757,6 +757,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_rejects_empty_stage() {
+        // A redirect-only stage has no argv — pipelines can't run it.
+        let res = eval_line_collect(&st(), "echo a | > /tmp/fern-empty-stage").await;
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("empty command in pipeline")
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_last_stage_ignores_non_stdout_redirects() {
+        // Known gap: only `>`/`>>` on the last stage applies; an input
+        // redirect there is dropped (the pipe feeds stdin).
+        let (_s, o) = eval_line_collect(&st(), "echo piped-in | cat 0< /dev/null")
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "piped-in");
+    }
+
+    #[tokio::test]
     async fn and_continues_on_success() {
         let (_s, o) = eval_line_collect(&st(), "true && echo continued")
             .await
