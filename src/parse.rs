@@ -73,7 +73,9 @@ enum Tok {
     Less,       // <
     Great,      // >
     GreatGreat, // >>
-    IoNumber(i32),
+    /// `N<`, `N>`, `N>>` — the lexer only emits this when digits directly
+    /// precede a redirect operator, so fd and op always arrive together.
+    FdRedirect(i32, RedirOp),
 }
 
 // ---------- Lexer -------------------------------------------------------
@@ -133,7 +135,8 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 c if c.is_ascii_digit() => {
-                    // Could be IoNumber (digits immediately followed by < or >) or a word.
+                    // Digits directly followed by < or > are an fd-prefixed
+                    // redirect; otherwise an ordinary word.
                     let start = self.pos;
                     while let Some(d) = self.peek() {
                         if d.is_ascii_digit() {
@@ -142,14 +145,29 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
-                    if matches!(self.peek(), Some(b'<') | Some(b'>')) {
-                        let n: i32 = std::str::from_utf8(&self.src[start..self.pos])?
-                            .parse()
-                            .map_err(|e| anyhow!("bad io number: {e}"))?;
-                        out.push(Tok::IoNumber(n));
-                    } else {
-                        self.pos = start;
-                        out.push(Tok::Word(self.read_word()?));
+                    match self.peek() {
+                        Some(b'<') | Some(b'>') => {
+                            let fd: i32 = std::str::from_utf8(&self.src[start..self.pos])?
+                                .parse()
+                                .map_err(|e| anyhow!("bad io number: {e}"))?;
+                            let op = if self.peek() == Some(b'<') {
+                                self.pos += 1;
+                                RedirOp::In
+                            } else {
+                                self.pos += 1;
+                                if self.peek() == Some(b'>') {
+                                    self.pos += 1;
+                                    RedirOp::Append
+                                } else {
+                                    RedirOp::Out
+                                }
+                            };
+                            out.push(Tok::FdRedirect(fd, op));
+                        }
+                        _ => {
+                            self.pos = start;
+                            out.push(Tok::Word(self.read_word()?));
+                        }
                     }
                 }
                 _ => out.push(Tok::Word(self.read_word()?)),
@@ -380,9 +398,14 @@ impl Parser {
             return Ok(None);
         }
         let s = self.parse_seq()?;
-        if self.peek().is_some() {
-            return Err(anyhow!("unexpected trailing tokens"));
-        }
+        // Structurally every token type is consumed by parse_seq and below
+        // (words/redirects by parse_command, |, &&, ||, ; by the statement
+        // levels) — nothing can remain. Keep the invariant checked in debug.
+        debug_assert!(
+            self.peek().is_none(),
+            "parser left trailing tokens: {:?}",
+            self.peek()
+        );
         Ok(Some(s))
     }
 
@@ -437,13 +460,7 @@ impl Parser {
         let mut redirects = Vec::new();
 
         loop {
-            if let Some(fd) = self.take_io_number() {
-                let op = match self.advance_or("expected < or > after fd number")? {
-                    Tok::Less => RedirOp::In,
-                    Tok::Great => RedirOp::Out,
-                    Tok::GreatGreat => RedirOp::Append,
-                    _ => return Err(anyhow!("expected < or > after fd number")),
-                };
+            if let Some((fd, op)) = self.take_fd_redirect() {
                 let target = match self.advance_or("expected file name after redirect")? {
                     Tok::Word(w) => w,
                     _ => return Err(anyhow!("expected file name after redirect")),
@@ -502,12 +519,12 @@ impl Parser {
         Ok(Command { words, redirects })
     }
 
-    /// Atomically take an IoNumber token if that's what's next.
-    fn take_io_number(&mut self) -> Option<i32> {
-        if let Some(Tok::IoNumber(n)) = self.peek() {
-            let n = *n;
+    /// Atomically take an fd-prefixed redirect token if that's what's next.
+    fn take_fd_redirect(&mut self) -> Option<(i32, RedirOp)> {
+        if let Some(Tok::FdRedirect(fd, op)) = self.peek() {
+            let (fd, op) = (*fd, *op);
             self.pos += 1;
-            Some(n)
+            Some((fd, op))
         } else {
             None
         }
@@ -549,11 +566,39 @@ mod tests {
         }
     }
 
-    fn cmd_words(stmt: &Stmt) -> Vec<Word> {
+    /// Extract the Command from a Stmt::Cmd. The panic arm is contract-tested
+    /// by `as_cmd_rejects_other_variants`.
+    #[track_caller]
+    fn as_cmd(stmt: &Stmt) -> &Command {
         match stmt {
-            Stmt::Cmd(c) => c.words.clone(),
-            _ => panic!("not a cmd"),
+            Stmt::Cmd(c) => c,
+            other => panic!("expected Cmd, got {other:?}"),
         }
+    }
+
+    /// Extract the stages from a Stmt::Pipe. Contract-tested likewise.
+    #[track_caller]
+    fn as_pipe(stmt: &Stmt) -> &[Command] {
+        match stmt {
+            Stmt::Pipe(cmds) => cmds,
+            other => panic!("expected Pipe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected Cmd")]
+    fn as_cmd_rejects_other_variants() {
+        as_cmd(&parse("a | b").unwrap().unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "expected Pipe")]
+    fn as_pipe_rejects_other_variants() {
+        as_pipe(&parse("a").unwrap().unwrap());
+    }
+
+    fn cmd_words(stmt: &Stmt) -> Vec<Word> {
+        as_cmd(stmt).words.clone()
     }
 
     #[test]
@@ -619,19 +664,12 @@ mod tests {
     fn io_numbers_and_digit_words() {
         // fd-prefixed redirect.
         let s = parse("echo hi 2> /tmp/e").unwrap().unwrap();
-        match &s {
-            Stmt::Cmd(c) => {
-                assert_eq!(c.redirects.len(), 1);
-                assert_eq!(c.redirects[0].fd, 2);
-            }
-            _ => panic!("not a cmd"),
-        }
+        let c = as_cmd(&s);
+        assert_eq!(c.redirects.len(), 1);
+        assert_eq!(c.redirects[0].fd, 2);
         // Multi-digit fd.
         let s = parse("echo hi 12> /tmp/e").unwrap().unwrap();
-        match &s {
-            Stmt::Cmd(c) => assert_eq!(c.redirects[0].fd, 12),
-            _ => panic!("not a cmd"),
-        }
+        assert_eq!(as_cmd(&s).redirects[0].fd, 12);
         // Digits NOT followed by < or > are an ordinary word.
         let s = parse("echo 2x").unwrap().unwrap();
         assert_eq!(cmd_words(&s)[1], w("2x"));
@@ -661,13 +699,9 @@ mod tests {
     fn input_fd_redirects_and_or_chains() {
         // fd-prefixed input redirect (0< file).
         let s = parse("cat 0< /etc/hostname").unwrap().unwrap();
-        match &s {
-            Stmt::Cmd(c) => {
-                assert_eq!(c.redirects[0].fd, 0);
-                assert_eq!(c.redirects[0].op, RedirOp::In);
-            }
-            _ => panic!("not a cmd"),
-        }
+        let c = as_cmd(&s);
+        assert_eq!(c.redirects[0].fd, 0);
+        assert_eq!(c.redirects[0].op, RedirOp::In);
         // Chained && / || mixes associate left.
         assert!(parse("true && false || echo saved").unwrap().is_some());
     }
@@ -770,68 +804,55 @@ mod tests {
     #[test]
     fn pipeline() {
         let s = parse("a | b | c").unwrap().unwrap();
-        match s {
-            Stmt::Pipe(cmds) => assert_eq!(cmds.len(), 3),
-            _ => panic!("expected pipe"),
-        }
+        assert_eq!(as_pipe(&s).len(), 3);
     }
 
     #[test]
     fn and_or_chain() {
         let s = parse("a && b || c").unwrap().unwrap();
-        match s {
-            Stmt::OrIf(l, _) => match *l {
-                Stmt::AndIf(_, _) => {}
-                _ => panic!("expected and inside or"),
-            },
-            _ => panic!("expected or"),
-        }
+        assert!(
+            matches!(&s, Stmt::OrIf(l, _) if matches!(**l, Stmt::AndIf(_, _))),
+            "expected OrIf(AndIf, _), got {s:?}"
+        );
     }
 
     #[test]
     fn sequence() {
         let s = parse("a; b; c").unwrap().unwrap();
-        match s {
-            Stmt::Seq(_, _) => {}
-            _ => panic!("expected seq"),
-        }
+        assert!(matches!(s, Stmt::Seq(_, _)), "expected Seq");
     }
 
     #[test]
     fn redirect_out() {
         let s = parse("ls > out.txt").unwrap().unwrap();
-        match s {
-            Stmt::Cmd(c) => {
-                assert_eq!(c.redirects.len(), 1);
-                assert_eq!(c.redirects[0].fd, 1);
-                assert_eq!(c.redirects[0].op, RedirOp::Out);
-                assert_eq!(c.redirects[0].target, w("out.txt"));
-            }
-            _ => panic!(),
-        }
+        let c = as_cmd(&s);
+        assert_eq!(c.redirects.len(), 1);
+        assert_eq!(c.redirects[0].fd, 1);
+        assert_eq!(c.redirects[0].op, RedirOp::Out);
+        assert_eq!(c.redirects[0].target, w("out.txt"));
     }
 
     #[test]
     fn redirect_stderr() {
         let s = parse("foo 2> err").unwrap().unwrap();
-        match s {
-            Stmt::Cmd(c) => {
-                assert_eq!(c.redirects[0].fd, 2);
-                assert_eq!(c.redirects[0].op, RedirOp::Out);
-            }
-            _ => panic!(),
-        }
+        let c = as_cmd(&s);
+        assert_eq!(c.redirects[0].fd, 2);
+        assert_eq!(c.redirects[0].op, RedirOp::Out);
     }
 
     #[test]
     fn redirect_append() {
         let s = parse("foo >> log").unwrap().unwrap();
-        match s {
-            Stmt::Cmd(c) => {
-                assert_eq!(c.redirects[0].op, RedirOp::Append);
-            }
-            _ => panic!(),
-        }
+        assert_eq!(as_cmd(&s).redirects[0].op, RedirOp::Append);
+    }
+
+    #[test]
+    fn fd_append_redirect() {
+        // `2>>` — fd + append in one token.
+        let s = parse("foo 2>> log").unwrap().unwrap();
+        let c = as_cmd(&s);
+        assert_eq!(c.redirects[0].fd, 2);
+        assert_eq!(c.redirects[0].op, RedirOp::Append);
     }
 
     #[test]
