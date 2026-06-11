@@ -783,7 +783,10 @@ fn render_branches(branches: &[BranchSnapshot], current: &str) {
                 .map(|h| h[..h.len().min(7)].to_string())
                 .unwrap_or_else(|| "-".to_string())
         };
-        println!("{marker} {:<24} #{:<4} {state}", b.name, b.tip);
+        // Flag terminal-mode branches so it's clear where the next command
+        // would run under a PTY.
+        let mode = if b.tty { " (tty)" } else { "" };
+        println!("{marker} {:<24} #{:<4} {state}{mode}", b.name, b.tip);
     }
 }
 
