@@ -385,10 +385,114 @@ async fn branch_is_tty(name: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// Live feed of other clients' activity, rendered into the cockpit while we
+/// sit at the prompt. Holds a persistent Subscribe connection so cells that
+/// land on our branch from elsewhere show up as they happen, instead of the
+/// prompt being blind to everyone else. `mine` suppresses echo of cells this
+/// cockpit submitted itself (their output already rendered inline).
+struct CockpitFeed {
+    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    /// Keeps the connection's write side open; the daemon never reads it.
+    _wr: tokio::net::unix::OwnedWriteHalf,
+    mine: std::collections::HashSet<CellId>,
+    /// Foreign cells on our branch currently being rendered.
+    foreign: std::collections::HashSet<CellId>,
+    /// Whether the last rendered chunk ended with a newline (so the status
+    /// line never lands mid-line).
+    at_line_start: bool,
+}
+
+impl CockpitFeed {
+    async fn open() -> Result<Self> {
+        let mut stream = connect().await?;
+        send_req(&mut stream, &Request::Subscribe).await?;
+        let (rd, wr) = stream.into_split();
+        Ok(Self {
+            lines: BufReader::new(rd).lines(),
+            _wr: wr,
+            mine: std::collections::HashSet::new(),
+            foreign: std::collections::HashSet::new(),
+            at_line_start: true,
+        })
+    }
+
+    /// Next broadcast event. Errors when the daemon goes away.
+    async fn next(&mut self) -> Result<CellEvent> {
+        while let Some(line) = self.lines.next_line().await? {
+            if let Ok(Response::Event(ev)) = serde_json::from_str::<Response>(&line) {
+                return Ok(ev);
+            }
+        }
+        Err(anyhow!("daemon closed the event stream"))
+    }
+
+    /// Render a foreign event if it belongs on `branch`. `at_prompt` tracks
+    /// whether the prompt line is currently showing — the first render of a
+    /// burst clears it, and the caller restores it once activity settles.
+    fn render(&mut self, branch: &str, ev: CellEvent, at_prompt: &mut bool) {
+        use std::io::Write;
+        let clear_prompt = |at_prompt: &mut bool| {
+            if *at_prompt {
+                print!("\r\x1b[K");
+                *at_prompt = false;
+            }
+        };
+        match ev {
+            CellEvent::Started {
+                id,
+                source,
+                who,
+                branch: b,
+                ..
+            } => {
+                if self.mine.contains(&id) || b != branch {
+                    return;
+                }
+                self.foreign.insert(id);
+                clear_prompt(at_prompt);
+                println!("[#{id} {who} on {b}] $ {source}");
+                self.at_line_start = true;
+            }
+            CellEvent::OutputChunk { id, stream, data } => {
+                if !self.foreign.contains(&id) {
+                    return;
+                }
+                clear_prompt(at_prompt);
+                match stream {
+                    Stream::Stdout => print!("{data}"),
+                    Stream::Stderr => eprint!("{data}"),
+                }
+                std::io::stdout().flush().ok();
+                if let Some(c) = data.chars().last() {
+                    self.at_line_start = c == '\n';
+                }
+            }
+            CellEvent::Completed {
+                id,
+                exit_code,
+                duration_ms,
+                ..
+            } => {
+                if !self.foreign.remove(&id) {
+                    return;
+                }
+                clear_prompt(at_prompt);
+                if !self.at_line_start {
+                    println!();
+                }
+                println!("[#{id} exit {exit_code} {duration_ms}ms]");
+                self.at_line_start = true;
+            }
+        }
+    }
+}
+
 /// The unified cockpit: attach to a branch and work on it. A finished tip gives
 /// a cooked prompt (each line extends the branch); a live PTY tip drops you into
 /// the raw terminal. On a `FERN_IO=tty` branch, commands you type are launched
 /// detached and you drive them raw; on a pipe branch they run inline + stream.
+/// While parked at the prompt, cells other clients land on this branch render
+/// live above it.
 pub async fn cockpit(target: Option<String>) -> Result<()> {
     use std::io::Write;
 
@@ -411,6 +515,7 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
+    let mut feed = CockpitFeed::open().await?;
 
     loop {
         // If the tip is running, follow it (raw if it's a terminal) first.
@@ -424,7 +529,23 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
 
         print!("(on {branch}) > ");
         std::io::stdout().flush().ok();
-        let Some(line) = lines.next_line().await? else {
+        // Wait for a line of input, rendering other clients' activity on this
+        // branch as it streams in. Both arms are cancel-safe.
+        let mut at_prompt = true;
+        let line = loop {
+            tokio::select! {
+                l = lines.next_line() => break l?,
+                ev = feed.next() => {
+                    feed.render(&branch, ev?, &mut at_prompt);
+                    if !at_prompt && feed.foreign.is_empty() {
+                        print!("(on {branch}) > ");
+                        std::io::stdout().flush().ok();
+                        at_prompt = true;
+                    }
+                }
+            }
+        };
+        let Some(line) = line else {
             break;
         };
         let t = line.trim().to_string();
@@ -432,10 +553,15 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
             continue;
         }
         if let Some(rest) = t.strip_prefix(':') {
+            let before = branch.clone();
             match cockpit_meta(&mut branch, rest).await {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => println!("error: {e}"),
+            }
+            if branch != before {
+                // Don't keep streaming cells from the branch we just left.
+                feed.foreign.clear();
             }
             continue;
         }
@@ -446,11 +572,14 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
         // them inline and stream. The builtin set is owned by the evaluator.
         if branch_is_tty(&branch).await? && !crate::eval::is_pure_builtin_line(&t) {
             match submit_detached(Some(branch.clone()), None, who, t).await {
-                Ok(id) => match follow(id).await {
-                    Ok(AttachOutcome::Detached) => return Ok(()),
-                    Ok(AttachOutcome::Completed) => {}
-                    Err(e) => println!("error: {e}"),
-                },
+                Ok(id) => {
+                    feed.mine.insert(id);
+                    match follow(id).await {
+                        Ok(AttachOutcome::Detached) => return Ok(()),
+                        Ok(AttachOutcome::Completed) => {}
+                        Err(e) => println!("error: {e}"),
+                    }
+                }
                 Err(e) => println!("error: {e}"),
             }
         } else {
@@ -467,6 +596,7 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
             .await
             {
                 Ok(snap) => {
+                    feed.mine.insert(snap.id);
                     let last = snap
                         .stderr
                         .chars()
