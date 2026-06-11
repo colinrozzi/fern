@@ -124,7 +124,15 @@ pub struct Tree {
     cells: HashMap<CellId, Cell>,
     children: HashMap<CellId, Vec<CellId>>,
     next_id: CellId,
+    /// Named, mutable pointers into the tree. A branch is a name → current tip
+    /// (a `CellId`). The tip moves forward as work lands on the branch, and may
+    /// point at a still-running cell (one with no content hash yet). The default
+    /// branch `main` is seeded at the root.
+    branches: BTreeMap<String, CellId>,
 }
+
+/// The default branch every tree starts with, pointing at the root cell.
+pub const DEFAULT_BRANCH: &str = "main";
 
 impl Tree {
     /// Create a tree rooted at a synthetic cell #0. The root's hash bakes in
@@ -151,10 +159,13 @@ impl Tree {
         );
         let mut children = HashMap::new();
         children.insert(0, vec![]);
+        let mut branches = BTreeMap::new();
+        branches.insert(DEFAULT_BRANCH.to_string(), 0);
         Self {
             cells,
             children,
             next_id: 1,
+            branches,
         }
     }
 
@@ -164,6 +175,47 @@ impl Tree {
 
     pub fn children_of(&self, id: CellId) -> &[CellId] {
         self.children.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    // ---------- Branches ------------------------------------------------
+
+    /// Current tip of `name`, if the branch exists.
+    pub fn branch_tip(&self, name: &str) -> Option<CellId> {
+        self.branches.get(name).copied()
+    }
+
+    pub fn branch_exists(&self, name: &str) -> bool {
+        self.branches.contains_key(name)
+    }
+
+    /// Create or move `name` to point at `id`.
+    pub fn set_branch(&mut self, name: impl Into<String>, id: CellId) {
+        self.branches.insert(name.into(), id);
+    }
+
+    /// Remove a branch. Returns false if it didn't exist. The root branch
+    /// can't be deleted via this (callers should guard), but nothing here
+    /// prevents it — the daemon enforces policy.
+    pub fn delete_branch(&mut self, name: &str) -> bool {
+        self.branches.remove(name).is_some()
+    }
+
+    /// Rename `from` → `to`, preserving the tip. Returns false if `from`
+    /// doesn't exist or `to` already does.
+    pub fn rename_branch(&mut self, from: &str, to: &str) -> bool {
+        if !self.branches.contains_key(from) || self.branches.contains_key(to) {
+            return false;
+        }
+        if let Some(id) = self.branches.remove(from) {
+            self.branches.insert(to.to_string(), id);
+            return true;
+        }
+        false
+    }
+
+    /// All branches as (name, tip) pairs, sorted by name.
+    pub fn branches(&self) -> impl Iterator<Item = (&String, CellId)> {
+        self.branches.iter().map(|(n, &id)| (n, id))
     }
 
     /// Allocate an id without inserting a cell. Used by the daemon when it
@@ -361,8 +413,10 @@ mod tests {
         let mut t = Tree::new(State::baseline().unwrap(), sys());
         let a = run(&mut t, 0, "cd /tmp").await;
         let b = run(&mut t, a, "pwd").await;
-        assert_eq!(cwd(&t, a), PathBuf::from("/tmp"));
-        assert_eq!(out(&t, b).trim(), "/tmp");
+        // `cd` canonicalizes, so on macOS /tmp resolves to /private/tmp.
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        assert_eq!(cwd(&t, a), tmp);
+        assert_eq!(out(&t, b).trim(), tmp.to_str().unwrap());
     }
 
     #[tokio::test]
@@ -450,6 +504,47 @@ mod tests {
         let a = run(&mut t, 0, "echo a").await;
         let b = run(&mut t, 0, "echo b").await;
         assert_ne!(t.get(a).unwrap().hash, t.get(b).unwrap().hash);
+    }
+
+    // ---------- Branch tests ------------------------------------------
+
+    #[test]
+    fn tree_seeds_default_branch_at_root() {
+        let t = Tree::new(State::baseline().unwrap(), sys());
+        assert_eq!(t.branch_tip(DEFAULT_BRANCH), Some(0));
+        assert!(t.branch_exists(DEFAULT_BRANCH));
+    }
+
+    #[test]
+    fn set_and_move_branch() {
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
+        t.set_branch("feature", 0);
+        assert_eq!(t.branch_tip("feature"), Some(0));
+        t.set_branch("feature", 5); // move it
+        assert_eq!(t.branch_tip("feature"), Some(5));
+    }
+
+    #[test]
+    fn delete_branch_removes_it() {
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
+        t.set_branch("tmp", 0);
+        assert!(t.delete_branch("tmp"));
+        assert!(!t.branch_exists("tmp"));
+        assert!(!t.delete_branch("tmp")); // already gone
+    }
+
+    #[test]
+    fn rename_branch_preserves_tip_and_guards() {
+        let mut t = Tree::new(State::baseline().unwrap(), sys());
+        t.set_branch("old", 3);
+        assert!(t.rename_branch("old", "new"));
+        assert_eq!(t.branch_tip("new"), Some(3));
+        assert!(!t.branch_exists("old"));
+        // can't rename a missing branch, or onto an existing one
+        assert!(!t.rename_branch("missing", "x"));
+        t.set_branch("a", 1);
+        t.set_branch("b", 2);
+        assert!(!t.rename_branch("a", "b"));
     }
 
     #[tokio::test]

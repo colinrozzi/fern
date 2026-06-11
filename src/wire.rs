@@ -13,24 +13,43 @@ use crate::tree::CellId;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
     Submit {
-        parent: CellId,
+        /// Branch this submission targets. The new cell becomes the tip of a
+        /// branch: if `parent` equals this branch's current tip (the common
+        /// case), the branch fast-forwards onto the new cell; otherwise the
+        /// new cell starts a fresh `fork-<uuid>` branch.
+        branch: String,
+        /// Explicit parent cell. `None` means "use `branch`'s current tip".
+        #[serde(default)]
+        parent: Option<CellId>,
         source: String,
         who: String,
         /// If true, daemon returns after the Started event and runs the cell
         /// in the background. Output streams via broadcast; tree shows the
-        /// cell with no exit_code until it completes (or is killed).
+        /// cell with no exit_code until it completes (or is killed). A cell on
+        /// a `FERN_IO=tty` branch run with detach is attachable (see `Attach`).
         #[serde(default)]
         detach: bool,
-        /// If true, the cell runs under a PTY (so isatty-aware programs see a
-        /// terminal). Required for `fern attach`. v1 requires `detach=true`
-        /// alongside this; you attach to the running cell from a separate client.
-        #[serde(default)]
-        interactive: bool,
     },
     Subscribe,
     GetTree,
     GetCell {
         id: CellId,
+    },
+    /// List all branches with their current tips.
+    ListBranches,
+    /// Create a branch `name` pointing at cell `at`.
+    CreateBranch {
+        name: String,
+        at: CellId,
+    },
+    /// Delete branch `name`.
+    DeleteBranch {
+        name: String,
+    },
+    /// Rename branch `from` → `to`, keeping the tip.
+    RenameBranch {
+        from: String,
+        to: String,
     },
     /// Abort a running detached cell.
     Kill {
@@ -57,6 +76,7 @@ pub enum Response {
     Event(CellEvent),
     Tree(TreeSnapshot),
     Cell(CellSnapshot),
+    Branches { branches: Vec<BranchSnapshot> },
     Error { message: String },
     Ok,
 }
@@ -76,6 +96,10 @@ pub enum CellEvent {
         parent: Option<CellId>,
         source: String,
         who: String,
+        /// Branch the new cell landed on. Equals the requested branch on a
+        /// fast-forward, or a fresh `fork-<uuid>` name when the parent wasn't
+        /// the requested branch's tip.
+        branch: String,
     },
     OutputChunk {
         id: CellId,
@@ -112,6 +136,19 @@ pub struct CellSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeSnapshot {
     pub cells: Vec<CellSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchSnapshot {
+    pub name: String,
+    pub tip: CellId,
+    /// Content hash of the tip cell. `None` while the tip is still running.
+    pub tip_hash: Option<String>,
+    /// True when the tip cell hasn't finished yet.
+    pub running: bool,
+    /// True when the branch is in terminal mode (the tip's inherited
+    /// environment carries `FERN_IO=tty`), so the next command runs under a PTY.
+    pub tty: bool,
 }
 
 pub fn socket_path() -> std::path::PathBuf {

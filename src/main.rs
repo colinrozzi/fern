@@ -2,7 +2,6 @@ mod client;
 mod daemon;
 mod eval;
 mod parse;
-mod repl;
 mod tree;
 mod wire;
 
@@ -21,7 +20,11 @@ enum Cmd {
     Daemon,
     /// Submit a command to the daemon and stream its output
     Run {
-        /// Parent cell (defaults to the last cell submitted by anyone)
+        /// Branch to run on (defaults to the current branch; see `fern switch`)
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// Parent cell. Defaults to the current branch's tip; pointing at a
+        /// historical cell forks a new branch.
         #[arg(short, long)]
         parent: Option<u64>,
         /// Who is submitting (defaults to $USER)
@@ -29,25 +32,48 @@ enum Cmd {
         who: Option<String>,
         /// Start the cell in the background; return immediately with its id.
         /// Output streams via `fern watch`; terminate with `fern kill <id>`.
+        /// On a `FERN_IO=tty` branch, a detached cell is attachable.
         #[arg(short, long)]
         detach: bool,
-        /// Run the cell under a PTY (so isatty-aware programs see a terminal).
-        /// Required for `fern attach`. Implies --detach.
-        #[arg(short, long)]
-        interactive: bool,
         /// Command line (joined with spaces)
         source: Vec<String>,
     },
     /// Kill a running detached cell
     Kill { id: u64 },
-    /// Attach to a running interactive cell (bidirectional: raw-mode terminal)
-    Attach { id: u64 },
+    /// Attach to a branch and work on it: a finished tip gives a cooked prompt
+    /// (each line extends the branch); a live terminal tip drops you into raw
+    /// mode. Defaults to the current branch. Ctrl+] / :quit to leave.
+    Attach { target: Option<String> },
+    /// Send one line of input to a running PTY cell (branch tip or cell id)
+    Send { target: String, data: Vec<String> },
     /// Tail every cell event from every client
     Watch,
     /// Dump the cell tree
     Tree,
-    /// Standalone REPL on the cell tree (no daemon, single-user)
+    /// List branches, or manage them (new/rm/rename)
+    Branch {
+        #[command(subcommand)]
+        action: Option<BranchAction>,
+    },
+    /// Switch the current branch (where the next `fern run` lands)
+    Switch { name: String },
+    /// Alias for `attach` on the current branch (cooked prompt cockpit).
     Repl,
+}
+
+#[derive(Subcommand)]
+enum BranchAction {
+    /// Create a new branch
+    New {
+        name: String,
+        /// Cell to base the branch on (defaults to the current branch's tip)
+        #[arg(short, long)]
+        at: Option<u64>,
+    },
+    /// Delete a branch
+    Rm { name: String },
+    /// Rename a branch, keeping its tip
+    Rename { from: String, to: String },
 }
 
 #[tokio::main]
@@ -55,28 +81,32 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon => daemon::run().await,
-        Cmd::Run { parent, who, detach, interactive, source } => {
+        Cmd::Run { branch, parent, who, detach, source } => {
             let line = source.join(" ");
             if line.trim().is_empty() {
                 anyhow::bail!("no command");
             }
-            if interactive || detach {
-                let id = client::submit_detached(parent, who, line, interactive).await?;
-                if interactive {
-                    println!("interactive: cell #{id} running; attach with `fern attach {id}`");
-                } else {
-                    println!("detached: cell #{id} running");
-                }
+            if detach {
+                let id = client::submit_detached(branch, parent, who, line).await?;
+                println!("detached: cell #{id} running");
                 Ok(())
             } else {
-                let code = client::run(parent, who, line).await?;
+                let code = client::run(branch, parent, who, line).await?;
                 std::process::exit(code);
             }
         }
         Cmd::Kill { id } => client::kill(id).await,
-        Cmd::Attach { id } => client::attach(id).await,
+        Cmd::Attach { target } => client::cockpit(target).await,
+        Cmd::Send { target, data } => client::send(target, data.join(" ")).await,
         Cmd::Watch => client::watch().await,
         Cmd::Tree => client::tree().await,
-        Cmd::Repl => repl::run().await,
+        Cmd::Branch { action } => match action {
+            None => client::branch_list().await,
+            Some(BranchAction::New { name, at }) => client::branch_new(name, at).await,
+            Some(BranchAction::Rm { name }) => client::branch_rm(name).await,
+            Some(BranchAction::Rename { from, to }) => client::branch_rename(from, to).await,
+        },
+        Cmd::Switch { name } => client::switch(name).await,
+        Cmd::Repl => client::cockpit(None).await,
     }
 }
