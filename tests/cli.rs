@@ -613,8 +613,10 @@ fn cockpit_on_tty_branch_runs_typed_commands_raw() {
     let mut c = pty::PtyClient::spawn(&d.dir, &["attach", "main"]);
     c.wait_for("(on main) >");
     // A typed external command on a tty branch launches detached + raw;
-    // `tty` proves the program really got a terminal.
-    c.writer.write_all(b"tty\r").unwrap();
+    // `tty` proves the program really got a terminal. The trailing bytes after
+    // \r arrive in the same chunk and must hand off from the cooked line
+    // reader to the raw follower without loss.
+    c.writer.write_all(b"tty\rxx").unwrap();
     c.writer.flush().unwrap();
     c.wait_for("/dev/");
     c.wait_for("(on main) >"); // back at the prompt after Completed
@@ -625,6 +627,34 @@ fn cockpit_on_tty_branch_runs_typed_commands_raw() {
     c.writer.flush().unwrap();
     let status = c.child.wait().unwrap();
     assert!(status.success());
+}
+
+#[test]
+fn detaching_from_a_typed_command_leaves_the_cockpit() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+
+    let mut c = pty::PtyClient::spawn(&d.dir, &["attach", "main"]);
+    c.wait_for("(on main) >");
+    // Type a long-running command, then Ctrl+] out of it: the cockpit exits
+    // (typed-command detach is "leave the cockpit", same as a tip detach).
+    c.writer.write_all(b"cat\r").unwrap();
+    c.writer.flush().unwrap();
+    c.wait_for("driving cell");
+    c.writer.write_all(&[0x1d]).unwrap();
+    c.writer.flush().unwrap();
+    let status = c.child.wait().unwrap();
+    assert!(status.success());
+    // The cat cell is still alive; clean it up.
+    let tree = d.ok(&["tree"]);
+    let id = tree
+        .lines()
+        .find(|l| l.contains(" cat "))
+        .and_then(|l| l.trim_start().strip_prefix('#'))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap()
+        .to_string();
+    d.ok(&["kill", &id]);
 }
 
 #[test]
@@ -1211,4 +1241,307 @@ fn branch_deleted_while_cell_runs_is_not_resurrected() {
     let dir = d.stop();
     let d2 = TestDaemon::start_in(dir);
     assert!(!d2.ok(&["branch"]).contains("doomed"));
+}
+
+// ---------- Endgame coverage scenarios --------------------------------------
+
+#[test]
+fn inline_and_detached_stderr_is_captured() {
+    let d = TestDaemon::start();
+    // Inline: stderr streams through and lands in the cell.
+    let out = d
+        .fern()
+        .args(["run", "bash -c 'echo only-err >&2'"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only-err"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Detached: stderr chunks accumulate into the stored result.
+    d.ok(&["run", "--detach", "bash -c 'echo det-err >&2'"]);
+    let start = Instant::now();
+    loop {
+        let tree = d.ok(&["tree"]);
+        if tree
+            .lines()
+            .any(|l| l.contains("det-err") && l.contains("exit 0"))
+        {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "tree: {tree}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn blank_lines_and_junk_in_protocol_are_tolerated() {
+    let d = TestDaemon::start();
+    // Leading blank lines are skipped by the daemon.
+    let sock = d.dir.join("fern.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(b"\n\n{\"kind\":\"get_cell\",\"id\":0}\n")
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert!(line.contains("\"cell\""), "got: {line}");
+}
+
+#[test]
+fn attach_session_ignores_garbage_and_foreign_requests() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+    d.ok(&["run", "--detach", "cat"]);
+    // Raw attach, then send garbage + a non-Input request + Input for the
+    // wrong id: all must be ignored without killing the session.
+    let sock = d.dir.join("fern.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(b"{\"kind\":\"attach\",\"id\":2}\n")
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\""), "got: {line}");
+    stream.write_all(b"not json at all\n").unwrap();
+    stream.write_all(b"{\"kind\":\"get_tree\"}\n").unwrap(); // non-Input: ignored
+    stream
+        .write_all(b"{\"kind\":\"input\",\"id\":999,\"data\":\"wrong id\"}\n")
+        .unwrap();
+    stream
+        .write_all(b"{\"kind\":\"input\",\"id\":2,\"data\":\"right-id\\n\"}\n")
+        .unwrap();
+    // cat echoes the good input back through the PTY → an event arrives.
+    let mut echoed = String::new();
+    reader.read_line(&mut echoed).unwrap();
+    assert!(echoed.contains("right-id"), "got: {echoed}");
+    d.ok(&["kill", "2"]);
+}
+
+#[test]
+fn cockpit_feed_renders_stderr_and_partial_lines() {
+    let d = TestDaemon::start();
+    let mut child = d
+        .fern()
+        .arg("attach")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    // Foreign cell with stderr output and no trailing newline.
+    d.ok(&[
+        "run",
+        "--who",
+        "other",
+        "bash -c 'echo noisy >&2; echo -n partial'",
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    stdin.write_all(b":quit\n").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("partial"), "stdout: {stdout}");
+    assert!(stderr.contains("noisy"), "stderr: {stderr}");
+}
+
+#[test]
+fn cockpit_inline_stderr_and_partial_output() {
+    let d = TestDaemon::start();
+    let (stdout, stderr) = cockpit(
+        &d,
+        "attach",
+        "bash -c 'echo cerr >&2; echo -n no-newline'\n:quit\n",
+    );
+    assert!(stdout.contains("no-newline"), "stdout: {stdout}");
+    assert!(stderr.contains("cerr"), "stderr: {stderr}");
+}
+
+#[test]
+fn deleting_the_current_branch_falls_back_to_main() {
+    let d = TestDaemon::start();
+    d.ok(&["branch", "new", "here"]);
+    d.ok(&["switch", "here"]);
+    let out = d.ok(&["branch", "rm", "here"]);
+    assert!(out.contains("switched to 'main'"), "got: {out}");
+    assert_eq!(
+        std::fs::read_to_string(d.dir.join("fern-branch"))
+            .unwrap()
+            .trim(),
+        "main"
+    );
+}
+
+#[test]
+fn branch_list_marks_running_tips() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "--detach", "sleep 2"]);
+    assert!(d.ok(&["branch"]).contains("running"));
+    d.ok(&["kill", "1"]);
+}
+
+#[test]
+fn branch_new_with_ghost_cursor_requires_at() {
+    let d = TestDaemon::start();
+    std::fs::write(d.dir.join("fern-branch"), "ghost").unwrap();
+    let (_o, e) = d.err(&["branch", "new", "orphan"]);
+    assert!(e.contains("pass --at"), "stderr: {e}");
+}
+
+#[test]
+fn watch_renders_stderr_and_error_lines() {
+    let d = TestDaemon::start();
+    let watch = d
+        .fern()
+        .args(["watch"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    d.ok(&["run", "bash -c 'echo werr >&2'"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let dir = d.stop();
+    let out = watch.wait_with_output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("werr"),
+        "watch stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------- Mock daemon matrix ----------------------------------------------
+
+/// Mock replying valid branches, then junk to everything else. Drives the
+/// "unexpected response" arms in send/attach flows that need a branch lookup
+/// to succeed first.
+fn mock_branches_then_junk(dir: &Path) {
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("fern.sock")).unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { break };
+            let mut line = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            if line.contains("list_branches") {
+                let _ = conn.write_all(
+                    b"{\"kind\":\"branches\",\"branches\":[{\"name\":\"main\",\"tip\":1,\"tip_hash\":null,\"running\":true,\"tty\":true}]}\n",
+                );
+            } else {
+                // Valid Response, wrong variant for every caller.
+                let _ = conn.write_all(b"{\"kind\":\"tree\",\"cells\":[]}\n");
+            }
+        }
+    });
+}
+
+#[test]
+fn unexpected_variant_responses_are_rejected_everywhere() {
+    // Junk-replying daemon: every verb must fail cleanly, not hang or panic.
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-junk-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    mock_daemon(
+        &dir,
+        Some(
+            r#"{"kind":"cell","id":0,"parent":null,"submitter":"x","source":"","exit_code":0,"duration_ms":0,"stdout":"","stderr":"","hash":null}"#,
+        ),
+    );
+    for args in [
+        &["tree"][..],
+        &["branch"],
+        &["branch", "rm", "x"],
+        &["branch", "new", "y", "--at", "0"],
+        &["branch", "rename", "a", "b"],
+    ] {
+        let out = Command::new(bin())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?} accepted junk");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Branches-then-junk daemon: send + attach get past the branch lookup,
+    // then hit the unexpected-variant arms.
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-junk2-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("fern-branch"), "main").unwrap();
+    mock_branches_then_junk(&dir);
+    for args in [&["send", "main", "hello"][..], &["attach"]] {
+        let out = Command::new(bin())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?} accepted junk");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("expected Ok"),
+            "{args:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn error_replying_daemon_propagates_messages() {
+    let dir = std::env::temp_dir().join(format!(
+        "fern-it-errd-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    mock_daemon(&dir, Some(r#"{"kind":"error","message":"synthetic-err"}"#));
+    for args in [&["tree"][..], &["branch"], &["branch", "rm", "x"]] {
+        let out = Command::new(bin())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("synthetic-err"),
+            "{args:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // watch renders the error line and exits cleanly when the mock hangs up.
+    let out = Command::new(bin())
+        .args(["watch"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("synthetic-err"),
+        "watch stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

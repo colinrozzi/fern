@@ -699,11 +699,10 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
                     if matches!(last, Some(c) if c != '\n') {
                         println!();
                     }
-                    let status = match snap.exit_code {
-                        Some(code) => format!("exit {code}"),
-                        None => "running".into(),
-                    };
-                    println!("[#{} {status} {}ms]", snap.id, snap.duration_ms);
+                    // A snapshot from submit_streaming always has an exit code
+                    // (it's built from the Completed event).
+                    let code = snap.exit_code.unwrap_or(-1);
+                    println!("[#{} exit {code} {}ms]", snap.id, snap.duration_ms);
                 }
                 Err(e) => println!("error: {e}"),
             }
