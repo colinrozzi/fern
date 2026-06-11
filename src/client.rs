@@ -805,18 +805,6 @@ pub async fn kill(id: CellId) -> Result<()> {
     }
 }
 
-/// Non-streaming wrapper around `submit_streaming` for callers that just want
-/// the final snapshot.
-#[allow(dead_code)]
-pub async fn submit(
-    branch: Option<String>,
-    parent: Option<CellId>,
-    who: Option<String>,
-    source: String,
-) -> Result<CellSnapshot> {
-    submit_streaming(branch, parent, who, source, |_, _| {}).await
-}
-
 pub async fn fetch_tree() -> Result<TreeSnapshot> {
     let mut stream = connect().await?;
     send_req(&mut stream, &Request::GetTree).await?;
@@ -1034,10 +1022,7 @@ fn render(ev: &CellEvent) {
 }
 
 fn render_branches(branches: &[BranchSnapshot], current: &str) {
-    if branches.is_empty() {
-        println!("(no branches)");
-        return;
-    }
+    // Never empty: the default branch is seeded at the root and undeletable.
     for b in branches {
         let marker = if b.name == current { "*" } else { " " };
         let state = if b.running {

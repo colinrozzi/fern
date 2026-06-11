@@ -152,6 +152,30 @@ pub struct BranchSnapshot {
 }
 
 pub fn socket_path() -> std::path::PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    socket_path_from(std::env::var("XDG_RUNTIME_DIR").ok())
+}
+
+/// Pure core of `socket_path`, separated so the fallback is testable without
+/// mutating process env.
+fn socket_path_from(runtime_dir: Option<String>) -> std::path::PathBuf {
+    let base = runtime_dir.unwrap_or_else(|| "/tmp".to_string());
     std::path::PathBuf::from(base).join("fern.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_resolution() {
+        assert_eq!(
+            socket_path_from(Some("/run/user/42".into())),
+            std::path::PathBuf::from("/run/user/42/fern.sock")
+        );
+        assert_eq!(
+            socket_path_from(None),
+            std::path::PathBuf::from("/tmp/fern.sock")
+        );
+        assert!(socket_path().ends_with("fern.sock"));
+    }
 }
