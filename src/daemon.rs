@@ -740,6 +740,11 @@ async fn handle_attach(
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
 
+    // Subscribe BEFORE any checks: a fast cell can complete between "is it
+    // active?" and the event loop, and a subscription opened only afterwards
+    // would never see its Completed — the attacher would hang.
+    let mut event_rx = state.events.subscribe();
+
     let Some(ac) = state.active.lock().await.get(&id).cloned() else {
         send(
             wr,
@@ -800,7 +805,6 @@ async fn handle_attach(
 
     send(wr, &Response::Ok).await?;
 
-    let mut event_rx = state.events.subscribe();
     loop {
         tokio::select! {
             ev_result = event_rx.recv() => {

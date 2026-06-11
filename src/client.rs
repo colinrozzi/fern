@@ -9,9 +9,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 
 use crate::tree::{CellId, DEFAULT_BRANCH};
 use crate::wire::{
@@ -238,11 +238,81 @@ enum AttachOutcome {
     Completed,
 }
 
+/// The process's single stdin reader. Stdin reads block and cannot be
+/// cancelled — a reader task abandoned mid-read swallows whatever the user
+/// types next. So the cockpit owns exactly ONE pump for its whole lifetime
+/// and consumes it either as cooked lines (at the prompt) or raw chunks
+/// (while driving a PTY cell); leftover bytes carry over between modes.
+struct StdinFeed {
+    rx: mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+}
+
+impl StdinFeed {
+    fn spawn() -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            rx,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Next raw chunk (for raw-mode follow). Buffered bytes drain first.
+    /// None = stdin closed. Cancel-safe.
+    async fn chunk(&mut self) -> Option<Vec<u8>> {
+        if !self.buf.is_empty() {
+            return Some(std::mem::take(&mut self.buf));
+        }
+        self.rx.recv().await
+    }
+
+    /// Next cooked line, without the trailing newline. None = stdin closed
+    /// (a final unterminated line is returned first). Cancel-safe.
+    async fn line(&mut self) -> Option<String> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let rest = self.buf.split_off(pos + 1);
+                let mut line = std::mem::replace(&mut self.buf, rest);
+                line.truncate(pos);
+                return Some(
+                    String::from_utf8_lossy(&line)
+                        .trim_end_matches('\r')
+                        .to_string(),
+                );
+            }
+            match self.rx.recv().await {
+                Some(bytes) => self.buf.extend_from_slice(&bytes),
+                None if self.buf.is_empty() => return None,
+                None => {
+                    let line = std::mem::take(&mut self.buf);
+                    return Some(String::from_utf8_lossy(&line).into_owned());
+                }
+            }
+        }
+    }
+}
+
 /// Connect to a running cell. If it's a PTY cell, run a raw bidirectional
 /// terminal (Ctrl+] detaches); otherwise stream its output until it completes.
-async fn follow(id: CellId) -> Result<AttachOutcome> {
+/// Reads input from the cockpit's shared stdin feed — no private reader, so
+/// no bytes are ever stranded in an abandoned read when the cell completes.
+async fn follow(id: CellId, stdin: &mut StdinFeed) -> Result<AttachOutcome> {
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-    use tokio::io::AsyncReadExt;
 
     let mut stream = connect().await?;
     send_req(&mut stream, &Request::Attach { id }).await?;
@@ -267,66 +337,77 @@ async fn follow(id: CellId) -> Result<AttachOutcome> {
     let _guard = RawModeGuard;
     eprintln!("[fern] driving cell #{id}. Ctrl+] to detach (leaves the cockpit).\r");
 
-    let detach_signal = Arc::new(tokio::sync::Notify::new());
-    let detach_signal_recv = detach_signal.clone();
-
-    let stdin_task = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = match stdin.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if buf[..n].contains(&0x1d) {
-                detach_signal.notify_one();
-                break;
-            }
-            let payload = String::from_utf8_lossy(&buf[..n]).into_owned();
-            let req = Request::Input { id, data: payload };
-            let mut line = serde_json::to_string(&req).unwrap();
-            line.push('\n');
-            if wr.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-            let _ = wr.flush().await;
-        }
-    });
-
-    let event_task = async {
+    let mut stdin_open = true;
+    let outcome = loop {
         use std::io::Write;
-        let mut stdout = std::io::stdout();
-        while let Some(line) = lines.next_line().await? {
-            match serde_json::from_str::<Response>(&line)? {
-                Response::Event(CellEvent::OutputChunk { data, .. }) => {
-                    stdout.write_all(data.as_bytes()).ok();
-                    stdout.flush().ok();
+        // Daemon events render in both cases; stdin forwards only while open
+        // (EOF — e.g. piped input exhausted — just stops the input side).
+        let event = tokio::select! {
+            ev = lines.next_line() => Some(ev?),
+            bytes = stdin.chunk(), if stdin_open => {
+                match bytes {
+                    None => {
+                        stdin_open = false;
+                    }
+                    Some(bytes) if bytes.contains(&0x1d) => {
+                        eprintln!("\r\n[fern] detached (cell still running)\r");
+                        break AttachOutcome::Detached;
+                    }
+                    Some(bytes) => {
+                        let req = Request::Input {
+                            id,
+                            data: String::from_utf8_lossy(&bytes).into_owned(),
+                        };
+                        let mut line = serde_json::to_string(&req)?;
+                        line.push('\n');
+                        if wr.write_all(line.as_bytes()).await.is_err() {
+                            break AttachOutcome::Completed;
+                        }
+                        let _ = wr.flush().await;
+                    }
                 }
-                Response::Event(CellEvent::Completed { exit_code, .. }) => {
-                    eprintln!("\r\n[fern] cell exited with code {exit_code}\r");
-                    return Ok::<_, anyhow::Error>(());
-                }
-                Response::Error { message } => {
-                    eprintln!("\r\n[fern] error: {message}\r");
-                    return Ok(());
-                }
-                _ => {}
+                None
             }
+        };
+        let Some(event) = event else { continue };
+        let Some(line) = event else {
+            break AttachOutcome::Completed; // daemon closed
+        };
+        match serde_json::from_str::<Response>(&line)? {
+            Response::Event(CellEvent::OutputChunk { data, .. }) => {
+                let mut stdout = std::io::stdout();
+                stdout.write_all(data.as_bytes()).ok();
+                stdout.flush().ok();
+            }
+            Response::Event(CellEvent::Completed { exit_code, .. }) => {
+                eprintln!("\r\n[fern] cell exited with code {exit_code}\r");
+                break AttachOutcome::Completed;
+            }
+            Response::Error { message } => {
+                eprintln!("\r\n[fern] error: {message}\r");
+                break AttachOutcome::Completed;
+            }
+            _ => {}
         }
-        Ok(())
     };
-
-    let outcome = tokio::select! {
-        _ = event_task => AttachOutcome::Completed,
-        _ = detach_signal_recv.notified() => {
-            eprintln!("\r\n[fern] detached (cell still running)\r");
-            AttachOutcome::Detached
-        }
-    };
-    stdin_task.abort();
     disable_raw_mode().ok();
     Ok(outcome)
+}
+
+/// Fetch one cell's snapshot by id.
+async fn fetch_cell(id: CellId) -> Result<CellSnapshot> {
+    let mut stream = connect().await?;
+    send_req(&mut stream, &Request::GetCell { id }).await?;
+    let (rd, _wr) = stream.split();
+    let mut lines = BufReader::new(rd).lines();
+    if let Some(line) = lines.next_line().await? {
+        return match serde_json::from_str::<Response>(&line)? {
+            Response::Cell(c) => Ok(c),
+            Response::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected: {other:?}")),
+        };
+    }
+    Err(anyhow!("connection closed before Cell response"))
 }
 
 /// Stream a (non-PTY) running cell's output until it completes. Used when the
@@ -337,6 +418,20 @@ async fn stream_until_done(id: CellId) -> Result<AttachOutcome> {
     send_req(&mut stream, &Request::Subscribe).await?;
     let (rd, _wr) = stream.split();
     let mut lines = BufReader::new(rd).lines();
+
+    // Check AFTER subscribing (so nothing can slip through the gap): a fast
+    // cell may already be done, and its events will never come again — replay
+    // the stored result instead of waiting forever.
+    if let Ok(cell) = fetch_cell(id).await
+        && let Some(exit_code) = cell.exit_code
+    {
+        print!("{}", cell.stdout);
+        eprint!("{}", cell.stderr);
+        std::io::stdout().flush().ok();
+        println!("[#{id} exit {exit_code} {}ms]", cell.duration_ms);
+        return Ok(AttachOutcome::Completed);
+    }
+
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Response>(&line)? {
             Response::Event(CellEvent::OutputChunk {
@@ -513,14 +608,13 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
     write_current_branch(&branch);
     println!("fern — attached to '{branch}'. :help for commands, :quit to leave.");
 
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut stdin = StdinFeed::spawn();
     let mut feed = CockpitFeed::open().await?;
 
     loop {
         // If the tip is running, follow it (raw if it's a terminal) first.
         if let Some((tip, true)) = branch_tip_state(&branch).await? {
-            match follow(tip).await? {
+            match follow(tip, &mut stdin).await? {
                 AttachOutcome::Detached => return Ok(()),
                 AttachOutcome::Completed => {}
             }
@@ -534,7 +628,7 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
         let mut at_prompt = true;
         let line = loop {
             tokio::select! {
-                l = lines.next_line() => break l?,
+                l = stdin.line() => break l,
                 ev = feed.next() => {
                     feed.render(&branch, ev?, &mut at_prompt);
                     if !at_prompt && feed.foreign.is_empty() {
@@ -574,7 +668,7 @@ pub async fn cockpit(target: Option<String>) -> Result<()> {
             match submit_detached(Some(branch.clone()), None, who, t).await {
                 Ok(id) => {
                     feed.mine.insert(id);
-                    match follow(id).await {
+                    match follow(id, &mut stdin).await {
                         Ok(AttachOutcome::Detached) => return Ok(()),
                         Ok(AttachOutcome::Completed) => {}
                         Err(e) => println!("error: {e}"),
