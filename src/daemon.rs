@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::AbortHandle;
 
 use crate::eval::PtyRegistration;
+use crate::store::{Record, Store};
 use crate::tree::{Cell, CellId, CellResult, State, SystemInfo, Tree};
 use crate::wire::{
     BranchSnapshot, CellEvent, CellSnapshot, Request, Response, Stream, TreeSnapshot, socket_path,
@@ -18,6 +19,9 @@ use crate::wire::{
 
 struct DaemonState {
     tree: Mutex<Tree>,
+    /// Append-only persistence log. Completed cells and branch ops are
+    /// appended here; the tree replays from it on startup.
+    store: Mutex<Store>,
     events: broadcast::Sender<CellEvent>,
     active: Mutex<HashMap<CellId, Arc<ActiveCell>>>,
 }
@@ -49,24 +53,48 @@ struct PtyHandle {
     killer: std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(store_path: Option<std::path::PathBuf>, fresh: bool) -> Result<()> {
     let path = socket_path();
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
 
+    // Restore the tree from the append-only log, or start a new one (and
+    // write its Root record so this lineage survives restarts from now on).
+    let log_path = store_path.unwrap_or_else(Store::default_path);
+    if fresh {
+        let _ = std::fs::remove_file(&log_path);
+    }
+    let (mut store, records) =
+        Store::open(&log_path).with_context(|| format!("open store {}", log_path.display()))?;
+    let (tree, restored) = match crate::store::replay(&records) {
+        Some(t) => (t, records.len()),
+        None => {
+            let state = State::baseline()?;
+            let sysinfo = SystemInfo::collect();
+            store.append(&Record::Root {
+                state: state.clone(),
+                sysinfo: sysinfo.clone(),
+            })?;
+            (Tree::new(state, sysinfo), 0)
+        }
+    };
+
     let sysinfo = SystemInfo::collect();
     eprintln!(
-        "fern daemon listening on {} (host={} fern v{})",
+        "fern daemon listening on {} (host={} fern v{}, store {} [{} records])",
         path.display(),
         sysinfo.hostname,
-        sysinfo.fern_version
+        sysinfo.fern_version,
+        log_path.display(),
+        restored,
     );
 
     let (events, _) = broadcast::channel(4096);
     let state = Arc::new(DaemonState {
-        tree: Mutex::new(Tree::new(State::baseline()?, sysinfo)),
+        tree: Mutex::new(tree),
         events,
         active: Mutex::new(HashMap::new()),
+        store: Mutex::new(store),
     });
 
     loop {
@@ -151,7 +179,13 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
                     )
                     .await?;
                 } else {
-                    t.set_branch(name, at);
+                    t.set_branch(name.clone(), at);
+                    drop(t);
+                    let _ = state
+                        .store
+                        .lock()
+                        .await
+                        .append(&Record::SetBranch { name, tip: at });
                     send(&mut wr, &Response::Ok).await?;
                 }
             }
@@ -167,6 +201,12 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
                 } else {
                     let mut t = state.tree.lock().await;
                     if t.delete_branch(&name) {
+                        drop(t);
+                        let _ = state
+                            .store
+                            .lock()
+                            .await
+                            .append(&Record::DeleteBranch { name });
                         send(&mut wr, &Response::Ok).await?;
                     } else {
                         send(
@@ -201,6 +241,12 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
                     .await?;
                 } else {
                     t.rename_branch(&from, &to);
+                    drop(t);
+                    let _ = state
+                        .store
+                        .lock()
+                        .await
+                        .append(&Record::RenameBranch { from, to });
                     send(&mut wr, &Response::Ok).await?;
                 }
             }
@@ -325,7 +371,14 @@ async fn handle_submit(
     // Started, so any client that races in on the event is guaranteed to find
     // the active entry (and can wait on it for the PTY to register).
     if detach {
-        start_detached(state.clone(), cell_id, parent_state.clone(), source.clone()).await;
+        start_detached(
+            state.clone(),
+            cell_id,
+            parent_state.clone(),
+            source.clone(),
+            landed_branch.clone(),
+        )
+        .await;
     }
 
     let started_event = CellEvent::Started {
@@ -333,7 +386,7 @@ async fn handle_submit(
         parent: Some(parent_cell),
         source: source.clone(),
         who: who.clone(),
-        branch: landed_branch,
+        branch: landed_branch.clone(),
     };
     let _ = state.events.send(started_event.clone());
     send(wr, &Response::Event(started_event)).await?;
@@ -345,7 +398,33 @@ async fn handle_submit(
     // Inline path. (Inline cells aren't attachable; a `FERN_IO=tty` command run
     // inline gets captured terminal output but no stdin — use --detach + attach
     // for interactive programs.)
-    run_inline(state, cell_id, parent_state, source, wr).await
+    run_inline(state, cell_id, parent_state, source, landed_branch, wr).await
+}
+
+/// Append a completed cell (and the branch that landed on it) to the
+/// persistence log. The SetBranch is guarded: only written if the branch
+/// still points at this cell in-memory (it could have been deleted while
+/// the cell ran).
+async fn persist_completed(state: &Arc<DaemonState>, cell_id: CellId, branch: &str) {
+    let (cell_rec, branch_current) = {
+        let t = state.tree.lock().await;
+        (
+            t.get(cell_id).and_then(crate::store::record_of),
+            t.branch_tip(branch) == Some(cell_id),
+        )
+    };
+    let Some(rec) = cell_rec else { return };
+    let mut store = state.store.lock().await;
+    if let Err(e) = store.append(&rec) {
+        eprintln!("fern store: failed to persist cell #{cell_id}: {e}");
+        return;
+    }
+    if branch_current {
+        let _ = store.append(&Record::SetBranch {
+            name: branch.to_string(),
+            tip: cell_id,
+        });
+    }
 }
 
 /// Prefix reserved for auto-generated fork branches. Users can't create names
@@ -390,6 +469,7 @@ async fn run_inline(
     cell_id: CellId,
     parent_state: State,
     source: String,
+    branch: String,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<CellEvent>(128);
@@ -464,6 +544,7 @@ async fn run_inline(
         );
         t.get(cell_id).and_then(|c| c.hash.clone())
     };
+    persist_completed(state, cell_id, &branch).await;
     let completed = CellEvent::Completed {
         id: cell_id,
         exit_code,
@@ -484,6 +565,7 @@ async fn start_detached(
     cell_id: CellId,
     parent_state: State,
     source: String,
+    branch: String,
 ) {
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<CellEvent>(128);
     let (reg_tx, mut reg_rx) = mpsc::unbounded_channel::<PtyRegistration>();
@@ -572,6 +654,8 @@ async fn start_detached(
             );
             t.get(cell_id).and_then(|c| c.hash.clone())
         };
+
+        persist_completed(&state, cell_id, &branch).await;
 
         // Wake any attacher still waiting for a PTY that will never arrive,
         // then drop the active entry.
