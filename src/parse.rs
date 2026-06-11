@@ -164,10 +164,10 @@ impl<'a> Lexer<'a> {
         };
 
         while let Some(c) = self.peek() {
-            if matches!(
-                c,
-                b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>' | b'#'
-            ) {
+            // `#` is NOT a word delimiter: mid-word it's literal (nixpkgs#protobuf).
+            // It only starts a comment at a word boundary, which
+            // skip_ws_and_comments handles before the next word begins.
+            if matches!(c, b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>') {
                 break;
             }
 
@@ -265,6 +265,11 @@ impl<'a> Lexer<'a> {
                 }
                 Ok(name)
             }
+            // `$?` — the last exit code (a State field, not an env var).
+            Some(b'?') => {
+                self.pos += 1;
+                Ok("?".to_string())
+            }
             Some(c) if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = self.pos;
                 while let Some(d) = self.peek() {
@@ -276,7 +281,9 @@ impl<'a> Lexer<'a> {
                 }
                 Ok(std::str::from_utf8(&self.src[start..self.pos])?.to_string())
             }
-            _ => Err(anyhow!("`$` must be followed by a name or `{{NAME}}`")),
+            _ => Err(anyhow!(
+                "`$` must be followed by a name, `{{NAME}}`, or `?`"
+            )),
         }
     }
 
@@ -497,6 +504,43 @@ mod tests {
     fn bare_words() {
         let s = parse("ls -la foo").unwrap().unwrap();
         assert_eq!(cmd_words(&s), vec![w("ls"), w("-la"), w("foo")]);
+    }
+
+    #[test]
+    fn hash_mid_word_is_literal() {
+        // `#` only starts a comment at a word boundary (bash rule) — mid-word
+        // it's part of the word (nix flakerefs, URL fragments, …).
+        let s = parse("nix shell nixpkgs#protobuf").unwrap().unwrap();
+        assert_eq!(
+            cmd_words(&s),
+            vec![w("nix"), w("shell"), w("nixpkgs#protobuf")]
+        );
+    }
+
+    #[test]
+    fn hash_at_word_boundary_still_comments() {
+        let s = parse("echo hi # a comment").unwrap().unwrap();
+        assert_eq!(cmd_words(&s), vec![w("echo"), w("hi")]);
+        assert!(parse("# only a comment").unwrap().is_none());
+    }
+
+    #[test]
+    fn dollar_question_parses() {
+        let s = parse("echo $?").unwrap().unwrap();
+        assert_eq!(
+            cmd_words(&s)[1],
+            Word {
+                segments: vec![Segment::Var("?".into())]
+            }
+        );
+        // ...and inside double quotes
+        let s = parse(r#"echo "code=$?""#).unwrap().unwrap();
+        assert_eq!(
+            cmd_words(&s)[1],
+            Word {
+                segments: vec![Segment::Literal("code=".into()), Segment::Var("?".into()),]
+            }
+        );
     }
 
     #[test]

@@ -100,11 +100,11 @@ async fn eval_command(
         // isatty-aware programs see a terminal). Redirects fall back to pipes.
         if tty_mode(state) && c.redirects.is_empty() {
             let exit = exec_under_pty(&argv, state, cell_id, events, pty_reg).await?;
-            return Ok((state.clone(), exit));
+            return Ok(done(state.clone(), exit));
         }
         let proc = Process::from_state(state, argv);
         let exit = exec_with_redirects(&proc, &c.redirects, state, cell_id, events).await?;
-        return Ok((state.clone(), exit));
+        return Ok(done(state.clone(), exit));
     }
 
     match name {
@@ -138,7 +138,7 @@ async fn eval_command(
             ns.env
                 .insert("PWD".into(), canon.to_string_lossy().into_owned());
             ns.cwd = canon;
-            Ok((ns, 0))
+            Ok(done(ns, 0))
         }
         "export" => {
             let mut ns = state.clone();
@@ -147,14 +147,14 @@ async fn eval_command(
                     ns.env.insert(arg[..eq].into(), arg[eq + 1..].into());
                 }
             }
-            Ok((ns, 0))
+            Ok(done(ns, 0))
         }
         "unset" => {
             let mut ns = state.clone();
             for arg in &argv[1..] {
                 ns.env.remove(arg);
             }
-            Ok((ns, 0))
+            Ok(done(ns, 0))
         }
         _ => unreachable!("non-builtin `{name}` reached builtin dispatch"),
     }
@@ -207,6 +207,14 @@ pub fn tty_mode(state: &State) -> bool {
         .get("FERN_IO")
         .map(|v| v == "tty")
         .unwrap_or(false)
+}
+
+/// Stamp a command's exit code into the state it returns, so `$?` sees it —
+/// both later in the same line (`false; echo $?`) and in child cells (the
+/// stamped state becomes the cell's end_state, which children inherit).
+fn done(mut s: State, exit: i32) -> (State, i32) {
+    s.last_exit = exit;
+    (s, exit)
 }
 
 async fn eval_pipeline(
@@ -293,7 +301,7 @@ async fn eval_pipeline(
     for t in stream_tasks {
         let _ = t.await;
     }
-    Ok((state.clone(), exit_code))
+    Ok(done(state.clone(), exit_code))
 }
 
 async fn apply_last_stdout_redirect(
@@ -535,7 +543,10 @@ fn expand_word(w: &Word, state: &State) -> String {
         match seg {
             Segment::Literal(s) => out.push_str(s),
             Segment::Var(name) => {
-                if let Some(v) = state.env.get(name) {
+                if name == "?" {
+                    // `$?` reads the inherited/threaded last exit code, not env.
+                    out.push_str(&state.last_exit.to_string());
+                } else if let Some(v) = state.env.get(name) {
                     out.push_str(v);
                 }
             }
@@ -594,6 +605,34 @@ mod tests {
         let (_s, o) = eval_line_collect(&st(), "echo hello").await.unwrap();
         assert_eq!(out_str(&o).trim(), "hello");
         assert_eq!(o.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn dollar_question_tracks_exit_codes() {
+        // Fresh state: nothing has run, $? is 0.
+        let (_s, o) = eval_line_collect(&st(), "echo $?").await.unwrap();
+        assert_eq!(out_str(&o).trim(), "0");
+
+        // Within a line: `false` stamps 1, the next stmt reads it.
+        let (_s, o) = eval_line_collect(&st(), "false; echo $?").await.unwrap();
+        assert_eq!(out_str(&o).trim(), "1");
+
+        // After a success it's back to 0.
+        let (_s, o) = eval_line_collect(&st(), "false; true; echo $?")
+            .await
+            .unwrap();
+        assert_eq!(out_str(&o).trim(), "0");
+    }
+
+    #[tokio::test]
+    async fn dollar_question_inherits_across_states() {
+        // A cell's end_state carries last_exit, so the *next* cell's $? sees
+        // how this one exited — inheritable state, like cwd/env.
+        let (s, o) = eval_line_collect(&st(), "bash -c 'exit 7'").await.unwrap();
+        assert_eq!(o.exit_code, 7);
+        assert_eq!(s.last_exit, 7);
+        let (_s, o) = eval_line_collect(&s, "echo $?").await.unwrap();
+        assert_eq!(out_str(&o).trim(), "7");
     }
 
     #[test]
