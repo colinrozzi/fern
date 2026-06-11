@@ -32,6 +32,9 @@ impl State {
                 env.insert(key.into(), v);
             }
         }
+        // Seed $PWD from the actual cwd (not the inherited env) so the root
+        // state is internally consistent; `cd` keeps it in sync from there.
+        env.insert("PWD".into(), cwd.to_string_lossy().into_owned());
         Ok(Self { cwd, env })
     }
 }
