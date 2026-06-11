@@ -2,6 +2,7 @@ mod client;
 mod daemon;
 mod eval;
 mod parse;
+mod store;
 mod tree;
 mod wire;
 
@@ -17,7 +18,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the daemon in the foreground
-    Daemon,
+    Daemon {
+        /// Path to the persistence log (defaults to $XDG_DATA_HOME/fern/tree.jsonl)
+        #[arg(long)]
+        store: Option<std::path::PathBuf>,
+        /// Discard any existing log and start a brand-new tree
+        #[arg(long)]
+        fresh: bool,
+    },
     /// Submit a command to the daemon and stream its output
     Run {
         /// Branch to run on (defaults to the current branch; see `fern switch`)
@@ -80,7 +88,7 @@ enum BranchAction {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Daemon => daemon::run().await,
+        Cmd::Daemon { store, fresh } => daemon::run(store, fresh).await,
         Cmd::Run {
             branch,
             parent,
