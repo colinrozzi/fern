@@ -26,3 +26,22 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Coverage ratchet: the floor only moves UP. When you add tests, raise
+      # --fail-under-lines to the new measured floor (rounded down). Target: 100.
+      - name: Coverage (ratchet)
+        run: cargo llvm-cov --summary-only --fail-under-lines 49
