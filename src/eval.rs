@@ -202,7 +202,11 @@ fn command_is_builtin(c: &Command) -> bool {
 /// True when the inherited environment asks for a terminal (`FERN_IO=tty`).
 /// Mode is configuration carried by the branch, not a per-cell flag.
 pub fn tty_mode(state: &State) -> bool {
-    state.env.get("FERN_IO").map(|v| v == "tty").unwrap_or(false)
+    state
+        .env
+        .get("FERN_IO")
+        .map(|v| v == "tty")
+        .unwrap_or(false)
 }
 
 async fn eval_pipeline(
@@ -251,19 +255,12 @@ async fn eval_pipeline(
         // would orphan and stream-readers would hang on still-live pipes.
         p.kill_on_drop(true);
 
-        let mut child = p
-            .spawn()
-            .map_err(|e| anyhow!("spawn {}: {e}", argv[0]))?;
+        let mut child = p.spawn().map_err(|e| anyhow!("spawn {}: {e}", argv[0]))?;
 
         // Stream stderr of every stage.
         if let Some(err) = child.stderr.take() {
             let tx = events.clone();
-            stream_tasks.push(tokio::spawn(stream_pipe(
-                err,
-                Stream::Stderr,
-                cell_id,
-                tx,
-            )));
+            stream_tasks.push(tokio::spawn(stream_pipe(err, Stream::Stderr, cell_id, tx)));
         }
 
         if !is_last {
@@ -272,7 +269,9 @@ async fn eval_pipeline(
                 .stdout
                 .take()
                 .ok_or_else(|| anyhow!("no stdout to pipe"))?;
-            let stdio: Stdio = stdout.try_into().map_err(|e| anyhow!("stdout→stdio: {e}"))?;
+            let stdio: Stdio = stdout
+                .try_into()
+                .map_err(|e| anyhow!("stdout→stdio: {e}"))?;
             prev_stdout = Some(stdio);
         } else if let Some(out) = child.stdout.take() {
             let tx = events.clone();
@@ -652,7 +651,9 @@ mod tests {
 
     #[tokio::test]
     async fn and_short_circuits() {
-        let (_s, o) = eval_line_collect(&st(), "false && echo nope").await.unwrap();
+        let (_s, o) = eval_line_collect(&st(), "false && echo nope")
+            .await
+            .unwrap();
         assert_ne!(o.exit_code, 0);
         assert!(out_str(&o).is_empty());
     }

@@ -81,7 +81,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon => daemon::run().await,
-        Cmd::Run { branch, parent, who, detach, source } => {
+        Cmd::Run {
+            branch,
+            parent,
+            who,
+            detach,
+            source,
+        } => {
             let line = source.join(" ");
             if line.trim().is_empty() {
                 anyhow::bail!("no command");

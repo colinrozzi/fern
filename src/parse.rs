@@ -61,13 +61,13 @@ pub enum RedirOp {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Word(Word),
-    Pipe,        // |
-    AndIf,       // &&
-    OrIf,        // ||
-    Semi,        // ;
-    Less,        // <
-    Great,       // >
-    GreatGreat,  // >>
+    Pipe,       // |
+    AndIf,      // &&
+    OrIf,       // ||
+    Semi,       // ;
+    Less,       // <
+    Great,      // >
+    GreatGreat, // >>
     IoNumber(i32),
 }
 
@@ -163,10 +163,11 @@ impl<'a> Lexer<'a> {
             }
         };
 
-        loop {
-            let Some(c) = self.peek() else { break };
-
-            if matches!(c, b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>' | b'#') {
+        while let Some(c) = self.peek() {
+            if matches!(
+                c,
+                b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>' | b'#'
+            ) {
                 break;
             }
 
@@ -512,10 +513,7 @@ mod tests {
         assert_eq!(
             words[1],
             Word {
-                segments: vec![
-                    Segment::Literal("hi ".into()),
-                    Segment::Var("USER".into()),
-                ]
+                segments: vec![Segment::Literal("hi ".into()), Segment::Var("USER".into()),]
             }
         );
     }
