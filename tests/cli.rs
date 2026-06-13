@@ -522,6 +522,11 @@ mod pty {
         pub child: Box<dyn portable_pty::Child + Send + Sync>,
         pub writer: Box<dyn std::io::Write + Send>,
         output: Arc<Mutex<String>>,
+        /// Byte offset into the output stream that `wait_for_new` has already
+        /// consumed, so a later wait for the same needle blocks for a *fresh*
+        /// occurrence instead of re-matching stale output (e.g. an earlier
+        /// prompt). The stream only grows, so the offset stays valid.
+        cursor: usize,
         _master: Box<dyn portable_pty::MasterPty + Send>,
     }
 
@@ -562,6 +567,7 @@ mod pty {
                 child,
                 writer,
                 output,
+                cursor: 0,
                 _master: pair.master,
             }
         }
@@ -577,6 +583,52 @@ mod pty {
                     start.elapsed() < Duration::from_secs(10),
                     "never saw {needle:?} in:\n{snap}"
                 );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Like `wait_for`, but only matches output produced *after* the
+        /// previous `wait_for_new` returned. Use this when the same string
+        /// (e.g. the cockpit prompt) appears more than once and the test must
+        /// synchronize on a specific later occurrence — otherwise a whole-buffer
+        /// `wait_for` matches the stale earlier one and races ahead.
+        pub fn wait_for_new(&mut self, needle: &str) -> String {
+            let start = Instant::now();
+            loop {
+                {
+                    let snap = self.output.lock().unwrap();
+                    let tail = snap.get(self.cursor..).unwrap_or("");
+                    if let Some(rel) = tail.find(needle) {
+                        self.cursor += rel + needle.len();
+                        return snap.clone();
+                    }
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "never saw new {needle:?} past offset {}:\n{}",
+                    self.cursor,
+                    self.output.lock().unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Wait for the child to exit, with a watchdog: if it hasn't exited
+        /// within 15s it's killed and the test panics with the captured output.
+        /// A hung cockpit then fails in seconds as an ordinary test failure,
+        /// instead of wedging until the CI job's 15-minute timeout.
+        pub fn wait(&mut self) -> portable_pty::ExitStatus {
+            let start = Instant::now();
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                if start.elapsed() > Duration::from_secs(15) {
+                    let out = self.output.lock().unwrap().clone();
+                    let _ = self.child.clone_killer().kill();
+                    let _ = self.child.wait();
+                    panic!("PtyClient did not exit within 15s; output so far:\n{out}");
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -598,7 +650,7 @@ fn raw_attach_drives_a_live_terminal_and_detaches() {
     c.writer.write_all(&[0x1d]).unwrap();
     c.writer.flush().unwrap();
     c.wait_for("detached");
-    let status = c.child.wait().unwrap();
+    let status = c.wait();
     assert!(status.success());
 
     // The cat cell survived the detach; kill it from a plain client.
@@ -611,21 +663,24 @@ fn cockpit_on_tty_branch_runs_typed_commands_raw() {
     d.ok(&["run", "export FERN_IO=tty"]);
 
     let mut c = pty::PtyClient::spawn(&d.dir, &["attach", "main"]);
-    c.wait_for("(on main) >");
+    c.wait_for_new("(on main) >");
     // A typed external command on a tty branch launches detached + raw;
     // `tty` proves the program really got a terminal. The trailing bytes after
     // \r arrive in the same chunk and must hand off from the cooked line
     // reader to the raw follower without loss.
     c.writer.write_all(b"tty\rxx").unwrap();
     c.writer.flush().unwrap();
-    c.wait_for("/dev/");
-    c.wait_for("(on main) >"); // back at the prompt after Completed
+    c.wait_for_new("/dev/");
+    // Must wait for the *post-Completed* prompt, not the startup one — typing
+    // before the raw follower exits would send those bytes to the cell, not
+    // the cockpit. `wait_for_new` ignores the earlier prompt already in buffer.
+    c.wait_for_new("(on main) >");
     // Builtins stay inline on a tty branch.
     c.writer.write_all(b"cd /tmp\r").unwrap();
     c.writer.flush().unwrap();
     c.writer.write_all(b":quit\r").unwrap();
     c.writer.flush().unwrap();
-    let status = c.child.wait().unwrap();
+    let status = c.wait();
     assert!(status.success());
 }
 
@@ -643,7 +698,7 @@ fn detaching_from_a_typed_command_leaves_the_cockpit() {
     c.wait_for("driving cell");
     c.writer.write_all(&[0x1d]).unwrap();
     c.writer.flush().unwrap();
-    let status = c.child.wait().unwrap();
+    let status = c.wait();
     assert!(status.success());
     // The cat cell is still alive; clean it up.
     let tree = d.ok(&["tree"]);
@@ -669,7 +724,7 @@ fn raw_attach_sees_completion_when_cell_killed_elsewhere() {
     c.wait_for("(on main) >"); // follow() returns Completed, cockpit prompts
     c.writer.write_all(b":quit\r").unwrap();
     c.writer.flush().unwrap();
-    let status = c.child.wait().unwrap();
+    let status = c.wait();
     assert!(status.success());
 }
 
@@ -962,7 +1017,7 @@ fn attach_survives_daemon_sigkill() {
     // Typing after the daemon died exercises the client's write-failure arm.
     let _ = c.writer.write_all(b"too late\r");
     let _ = c.writer.flush();
-    let status = c.child.wait().unwrap();
+    let status = c.wait();
     assert!(
         !status.success(),
         "client should exit nonzero after daemon death"
@@ -1094,7 +1149,7 @@ fn follow_handles_mid_attach_error_event() {
     c.wait_for("(on main) >");
     c.writer.write_all(b":quit\r").unwrap();
     c.writer.flush().unwrap();
-    let status = c.child.wait().unwrap();
+    let status = c.wait();
     assert!(status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }
