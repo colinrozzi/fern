@@ -84,6 +84,16 @@ async fn send_req(stream: &mut UnixStream, req: &Request) -> Result<()> {
     Ok(())
 }
 
+/// Open a persistent broadcast subscription. The returned stream yields
+/// newline-delimited `Response::Event` lines for every cell on every branch —
+/// the feed a multi-pane client follows so cells landing on a pane's branch
+/// (from any client) show up live.
+pub(crate) async fn open_subscription() -> Result<UnixStream> {
+    let mut stream = connect().await?;
+    send_req(&mut stream, &Request::Subscribe).await?;
+    Ok(stream)
+}
+
 /// Submit a command; invoke `on_chunk(stream, data)` for each OutputChunk as
 /// it streams in; return the final CellSnapshot when Completed.
 pub async fn submit_streaming<F>(
@@ -837,7 +847,7 @@ pub async fn fetch_branches() -> Result<Vec<BranchSnapshot>> {
 }
 
 /// Send a request that expects a bare `Ok`/`Error` reply.
-async fn send_expect_ok(req: &Request) -> Result<()> {
+pub(crate) async fn send_expect_ok(req: &Request) -> Result<()> {
     let mut stream = connect().await?;
     send_req(&mut stream, req).await?;
     let (rd, _wr) = stream.split();

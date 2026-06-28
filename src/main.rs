@@ -1,6 +1,7 @@
 mod client;
 mod daemon;
 mod eval;
+mod mux;
 mod parse;
 mod store;
 mod tree;
@@ -67,6 +68,9 @@ enum Cmd {
     Switch { name: String },
     /// Alias for `attach` on the current branch (cooked prompt cockpit).
     Repl,
+    /// Open the terminal multiplexer: tiled panes, each a viewport onto a
+    /// branch. Ctrl+a then %/" to split (forks a branch), o to switch, q to quit.
+    Mux,
 }
 
 #[derive(Subcommand)]
@@ -122,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Switch { name } => client::switch(name).await,
         Cmd::Repl => exit_after(client::cockpit(None).await),
+        Cmd::Mux => exit_after(mux::run().await),
     }
 }
 

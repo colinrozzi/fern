@@ -118,6 +118,28 @@ hello
 
 `fern repl` is an alias for `fern attach` on the current branch.
 
+## The multiplexer
+
+`fern mux` is a tmux-style cockpit: tiled panes where **each pane is a viewport
+onto a branch**. It opens with the current branch's history already filled in
+(walked out of the tree), and because the daemon owns one shared tree, a cell
+landing on a pane's branch — from this mux or any other client — streams into
+that pane live.
+
+```bash
+fern mux
+# Ctrl-a then:
+#   %   split the focused pane side by side   (forks a new branch at its tip)
+#   "   split stacked                          (likewise)
+#   o   move focus to the next pane
+#   q   quit (panes keep living in the daemon)
+```
+
+A split is also a **fork**: the new pane starts a fresh branch at the focused
+pane's tip, so the two panes share history up to the split and diverge forward —
+a pane split that's also a git-style branch. This is a prototype (pipe-mode
+panes; a live-tty tip — vim in a pane — needs PTY resize, still to come).
+
 ## The model
 
 The whole thing rests on one design call: a cell is a discrete process spawn, not a screen-grid coordinate. That choice eliminates the rough edges of `tmux`-style sharing (prompt scraping, byte-timing, no exit codes) and lights up the things you'd actually want from a shared session:
@@ -143,6 +165,7 @@ Flat modules in `src/`:
 | `wire.rs` | Protocol types (`Request`, `Response`, `CellEvent`, `CellSnapshot`, `BranchSnapshot`) |
 | `daemon.rs` | Unix-socket server, the cell tree + branches, broadcast, inline/detached execution, PTY attach |
 | `client.rs` | Daemon RPCs + CLI verbs (`run`/`watch`/`tree`/`branch`/`switch`/`attach`/`send`/`kill`) + the cockpit |
+| `mux.rs` | The `fern mux` multiplexer: a client-local layout tree of panes, each a branch viewport, fed by one shared subscription |
 | `main.rs` | `clap` CLI |
 
 ## Limitations
