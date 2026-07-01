@@ -17,11 +17,13 @@ quarantined. This is a **temporary** waiver, not residue: when the PTY harness
 lands (drive `fern mux` under a pty, assert on `capture-pane`-style frames),
 drop the ignore and fold mux back under the ratchet.
 
-The floor stepped down 98 → 97 for one reason: the `Cmd::Mux` dispatch arm in
-`main.rs` launches the TUI, so it can't be unit-covered, and that single line
-pulls the *non-mux* total to 97.9%. Everything except that arm (and the
-documented residue below) is still covered. Re-raise toward 100 as before once
-the mux harness exists.
+The floor stepped down 98 → 97 because of code that only the mux exercises but
+that lives *outside* `mux.rs`: the `Cmd::Mux` dispatch arm in `main.rs` (launches
+the TUI) and the mux-only transport helpers in `client.rs`
+(`open_subscription`, `open_attach`) — none reachable without running the TUI.
+They pull the *non-mux* total to ~97.8%. Everything else (and the documented
+residue below) is still covered. When the mux PTY harness lands it exercises
+these too; re-raise toward 100 then.
 
 ## How we got here
 

@@ -130,6 +130,7 @@ that pane live.
 ```bash
 fern mux
 # Ctrl-a then:
+#   e   run the typed command (or $SHELL) as a live terminal program in the pane
 #   %   split the focused pane side by side   (forks a new branch at its tip)
 #   "   split stacked                          (likewise)
 #   o   move focus to the next pane
@@ -138,9 +139,12 @@ fern mux
 
 A split is also a **fork**: the new pane starts a fresh branch at the focused
 pane's tip, so the two panes share history up to the split and diverge forward —
-a pane split that's also a git-style branch. This is a prototype (pipe-mode
-panes; a live-tty tip — vim in a pane — needs a client-side VT grid, still to
-come, though the `fern resize` primitive it will lean on already exists).
+a pane split that's also a git-style branch.
+
+`Ctrl-a e` turns a pane into a **live terminal**: type a command (e.g. `vim`,
+`top`) and it launches under a PTY, renders into a `vt100` grid, and takes raw
+keystrokes — reflowing to the pane's size via `fern resize`. Still a prototype
+(one merged terminal stream; no scrollback in the grid yet).
 
 ## The model
 
