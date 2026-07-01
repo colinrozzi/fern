@@ -93,10 +93,11 @@ To interact with a terminal program, run it **detached** on a `FERN_IO=tty` bran
 fern run --detach 'vim notes.txt'     # attachable terminal cell at the tip
 fern attach main                      # raw bidirectional terminal; Ctrl+] detaches
 fern send main 'some input'           # or inject one line non-interactively (scriptable)
+fern resize main 40 100               # reflow the terminal to rows×cols (waits for it to take effect)
 fern kill 7                           # terminate a running cell
 ```
 
-`attach` and `send` take a **branch name or a cell id** — a branch resolves to its current tip.
+`attach`, `send`, and `resize` take a **branch name or a cell id** — a branch resolves to its current tip.
 
 ## The cockpit
 
@@ -138,7 +139,8 @@ fern mux
 A split is also a **fork**: the new pane starts a fresh branch at the focused
 pane's tip, so the two panes share history up to the split and diverge forward —
 a pane split that's also a git-style branch. This is a prototype (pipe-mode
-panes; a live-tty tip — vim in a pane — needs PTY resize, still to come).
+panes; a live-tty tip — vim in a pane — needs a client-side VT grid, still to
+come, though the `fern resize` primitive it will lean on already exists).
 
 ## The model
 

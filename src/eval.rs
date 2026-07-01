@@ -42,8 +42,14 @@ pub async fn eval_line(
 /// reach a still-running terminal cell: write to `input`, terminate via `killer`.
 pub struct PtyRegistration {
     pub input: mpsc::UnboundedSender<Vec<u8>>,
+    pub resize: mpsc::UnboundedSender<ResizeReq>,
     pub killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
+
+/// A resize request: new `(rows, cols)` plus a one-shot the PTY thread fires
+/// once `master.resize` has been applied, so the daemon can reply only after
+/// the size actually took effect.
+pub type ResizeReq = (u16, u16, tokio::sync::oneshot::Sender<()>);
 
 #[async_recursion::async_recursion]
 async fn eval_stmt(
@@ -453,9 +459,37 @@ async fn exec_under_pty(
         .map_err(|e| anyhow!("spawn {}: {e}", argv[0]))?;
     let reader = pair.master.try_clone_reader()?;
 
-    // If a registrar is present, expose input + kill controls for this cell.
+    // Take the writer (only registrable cells need stdin) BEFORE the master
+    // moves into the resize thread below — both borrow the master.
+    let writer = match pty_reg {
+        Some(_) => Some(pair.master.take_writer()?),
+        None => None,
+    };
+
+    // The master lives in its own thread that applies resize requests and acks
+    // each one. Keeping it here for the child's whole life (rather than dropping
+    // it at function end) lets an attacher reflow the terminal; it closes only
+    // once every resize sender is gone (this fn after `child.wait`, plus the
+    // daemon's PtyHandle for a registered cell).
+    let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<ResizeReq>();
+    let master = pair.master;
+    std::thread::spawn(move || {
+        use portable_pty::PtySize;
+        let master = master;
+        while let Some((rows, cols, ack)) = resize_rx.blocking_recv() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+            let _ = ack.send(());
+        }
+    });
+
+    // If a registrar is present, expose input + resize + kill controls.
     if let Some(reg) = pty_reg {
-        let writer = pair.master.take_writer()?;
+        let writer = writer.expect("writer is taken whenever pty_reg is Some");
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         std::thread::spawn(move || {
             use std::io::Write;
@@ -469,6 +503,7 @@ async fn exec_under_pty(
         });
         let _ = reg.send(PtyRegistration {
             input: input_tx,
+            resize: resize_tx.clone(),
             killer: child.clone_killer(),
         });
     }
@@ -501,7 +536,10 @@ async fn exec_under_pty(
         .map_err(|e| anyhow!("pty wait join: {e}"))?
         .map_err(|e| anyhow!("pty wait: {e}"))?;
     let _ = reader_thread.join();
-    drop(pair.master);
+    // Release our resize sender now the child is gone. A registered cell's
+    // master stays alive via the daemon's clone until its PtyHandle drops; an
+    // unregistered cell's master closes here (the sole sender is gone).
+    drop(resize_tx);
 
     Ok(status.exit_code() as i32)
 }

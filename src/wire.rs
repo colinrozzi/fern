@@ -68,6 +68,15 @@ pub enum Request {
         id: CellId,
         data: String,
     },
+    /// Resize a running terminal cell's PTY. The daemon applies the new window
+    /// size to the cell's PTY master and replies `Ok` once it has taken effect
+    /// (so a caller can sequence input after a resize). A one-shot request, like
+    /// `Kill` — no Attach session required.
+    Resize {
+        id: CellId,
+        rows: u16,
+        cols: u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

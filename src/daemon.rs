@@ -48,6 +48,9 @@ struct ActiveCell {
 struct PtyHandle {
     /// Sender for bytes to write to the PTY's stdin.
     input: mpsc::UnboundedSender<Vec<u8>>,
+    /// Sender for resize requests; each carries a one-shot the PTY acks so a
+    /// resize reply can wait for the new size to take effect.
+    resize: mpsc::UnboundedSender<crate::eval::ResizeReq>,
     /// Kills the PTY child. Wrapped in a std Mutex so `kill` can take `&mut`.
     killer: std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
 }
@@ -295,6 +298,9 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
                 }
             }
             Request::Kill { id } => handle_kill(&state, id, &mut wr).await?,
+            Request::Resize { id, rows, cols } => {
+                handle_resize(&state, id, rows, cols, &mut wr).await?
+            }
             Request::Attach { id } => {
                 handle_attach(&state, id, &mut lines, &mut wr).await?;
                 break;
@@ -622,6 +628,7 @@ async fn start_detached(
         while let Some(reg) = reg_rx.recv().await {
             *reg_ac.pty.lock().await = Some(PtyHandle {
                 input: reg.input,
+                resize: reg.resize,
                 killer: std::sync::Mutex::new(reg.killer),
             });
             reg_ac.ready.notify_waiters();
@@ -733,6 +740,50 @@ async fn handle_kill(
             .await?
         }
     }
+    Ok(())
+}
+
+/// Resize a running terminal cell's PTY. Waits for the PTY thread to ack (so
+/// the reply means the size has taken effect), then replies `Ok`. Fails when
+/// the cell isn't running or isn't a terminal (no PTY to resize).
+async fn handle_resize(
+    state: &Arc<DaemonState>,
+    id: CellId,
+    rows: u16,
+    cols: u16,
+    wr: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    // Clone the resize sender out under the lock, then drop the guard before
+    // awaiting the ack (never hold a cell lock across an await).
+    let resize = match state.active.lock().await.get(&id).cloned() {
+        Some(ac) => ac.pty.lock().await.as_ref().map(|p| p.resize.clone()),
+        None => {
+            send(
+                wr,
+                &Response::Error {
+                    message: format!("cell #{id} is not running"),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let Some(resize) = resize else {
+        send(
+            wr,
+            &Response::Error {
+                message: format!("cell #{id} is not a terminal (nothing to resize)"),
+            },
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if resize.send((rows, cols, ack_tx)).is_ok() {
+        let _ = ack_rx.await; // wait for the resize to actually apply
+    }
+    send(wr, &Response::Ok).await?;
     Ok(())
 }
 
