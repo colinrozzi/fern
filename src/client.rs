@@ -797,6 +797,13 @@ pub async fn send(target: String, data: String) -> Result<()> {
     Ok(())
 }
 
+/// Resize a running terminal cell's PTY (branch tip or cell id). Returns once
+/// the daemon confirms the new size took effect.
+pub async fn resize(target: String, rows: u16, cols: u16) -> Result<()> {
+    let id = resolve_target(&target).await?;
+    send_expect_ok(&Request::Resize { id, rows, cols }).await
+}
+
 pub async fn kill(id: CellId) -> Result<()> {
     let mut stream = connect().await?;
     send_req(&mut stream, &Request::Kill { id }).await?;

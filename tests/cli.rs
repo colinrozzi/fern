@@ -310,6 +310,71 @@ fn tty_branch_send_and_capture() {
     d.ok(&["kill", &id]);
 }
 
+#[test]
+fn resize_reflows_the_terminal_and_rejects_bad_targets() {
+    let d = TestDaemon::start();
+    d.ok(&["run", "export FERN_IO=tty"]);
+    // A tty cell that blocks on a line of input, then reports its window size.
+    // Resizing before we unblock it means `stty size` observes the new size.
+    let out = d.ok(&["run", "--detach", r#"sh -c "read x; stty size""#]);
+    let id = out
+        .trim()
+        .trim_start_matches("detached: cell #")
+        .trim_end_matches(" running")
+        .to_string();
+
+    // The PTY registers a beat after Started; poll the resize until it lands.
+    let start = Instant::now();
+    loop {
+        let r = d
+            .fern()
+            .args(["resize", "main", "40", "100"])
+            .output()
+            .unwrap();
+        if r.status.success() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "resize never succeeded: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Now unblock the cell — `stty size` runs strictly after the resize acked.
+    d.ok(&["send", "main", ""]);
+
+    let start = Instant::now();
+    let reflowed = loop {
+        let resp = raw_request(&d.dir, &format!(r#"{{"kind":"get_cell","id":{id}}}"#));
+        if resp.contains("40 100") {
+            break true;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    assert!(reflowed, "cell never reported the resized 40x100 window");
+
+    // Resizing a cell that isn't running fails.
+    let (_o, e) = d.err(&["resize", "9999", "40", "100"]);
+    assert!(e.contains("not running"), "stderr: {e}");
+
+    // Resizing a running *pipe* cell (no PTY) fails with a clear message.
+    let sleep_out = d.ok(&[
+        "run", "--branch", "main", "--parent", "0", "--detach", "sleep 30",
+    ]);
+    let pipe_id = sleep_out
+        .trim()
+        .trim_start_matches("detached: cell #")
+        .trim_end_matches(" running")
+        .to_string();
+    let (_o, e) = d.err(&["resize", &pipe_id, "40", "100"]);
+    assert!(e.contains("not a terminal"), "stderr: {e}");
+    d.ok(&["kill", &pipe_id]);
+}
+
 // ---------- Watch ---------------------------------------------------------
 
 #[test]

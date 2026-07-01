@@ -55,6 +55,12 @@ enum Cmd {
     Attach { target: Option<String> },
     /// Send one line of input to a running PTY cell (branch tip or cell id)
     Send { target: String, data: Vec<String> },
+    /// Resize a running terminal cell's PTY (branch tip or cell id)
+    Resize {
+        target: String,
+        rows: u16,
+        cols: u16,
+    },
     /// Tail every cell event from every client
     Watch,
     /// Dump the cell tree
@@ -116,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Kill { id } => client::kill(id).await,
         Cmd::Attach { target } => exit_after(client::cockpit(target).await),
         Cmd::Send { target, data } => client::send(target, data.join(" ")).await,
+        Cmd::Resize { target, rows, cols } => client::resize(target, rows, cols).await,
         Cmd::Watch => client::watch().await,
         Cmd::Tree => client::tree().await,
         Cmd::Branch { action } => match action {
