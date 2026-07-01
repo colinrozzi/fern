@@ -94,6 +94,15 @@ pub(crate) async fn open_subscription() -> Result<UnixStream> {
     Ok(stream)
 }
 
+/// Open a bidirectional attach to a running PTY cell. The caller reads the
+/// `Ok`/`Error` handshake line, then streams `OutputChunk` events and writes
+/// `Input` requests on the returned stream. Used by the mux for live-tty panes.
+pub(crate) async fn open_attach(id: CellId) -> Result<UnixStream> {
+    let mut stream = connect().await?;
+    send_req(&mut stream, &Request::Attach { id }).await?;
+    Ok(stream)
+}
+
 /// Submit a command; invoke `on_chunk(stream, data)` for each OutputChunk as
 /// it streams in; return the final CellSnapshot when Completed.
 pub async fn submit_streaming<F>(
